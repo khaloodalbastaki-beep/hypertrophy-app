@@ -1518,7 +1518,7 @@ function SyncSettings({ status, lastSyncAt, onSave, onSyncNow }) {
   const [repo, setRepo] = useState(sync.getRepo());
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState(null);
-  const save = async () => { setBusy(true); setMsg(null); const r = await onSave(token, repo); setMsg(r); setBusy(false); };
+  const save = async () => { setBusy(true); setMsg(null); const r = await onSave(token, repo); setMsg(r); setBusy(false); if (r.ok) { setToken(''); setOpen(false); } };
   const color = status === 'synced' ? '#22c55e' : status === 'syncing' ? '#facc15' : status === 'off' ? '#666' : status === 'offline' ? '#888' : '#ef4444';
   const label = status === 'synced' ? 'Synced' : status === 'syncing' ? 'Syncing…' : status === 'off' ? 'Not connected' : status === 'offline' ? 'Offline — saved on this device' : status === 'error' ? 'Error' : 'Idle';
   return (
