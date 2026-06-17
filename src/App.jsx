@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Dumbbell, Calendar, TrendingUp, Settings, RotateCcw, Camera, Download, Upload, Plus, Minus, Check, X, ChevronDown, ChevronRight, Youtube, Flame, Apple, Bike, Moon, Clock, Target, Edit3, Play, Square, Info, AlertCircle, Shield, Database, Copy, ClipboardPaste } from 'lucide-react';
 import * as XLSX from 'xlsx';
+import * as sync from './github-sync.js';
 
 // ============================================================
 // EXERCISE DETAILS
@@ -463,6 +464,14 @@ export default function HypertrophyApp() {
   const [toast, setToast] = useState(null);
   const [zoomPhoto, setZoomPhoto] = useState(null);
 
+  // GitHub two-way sync
+  const [syncStatus, setSyncStatus] = useState(sync.isConfigured() ? 'idle' : 'off'); // off|idle|syncing|synced|offline|error
+  const [lastSyncAt, setLastSyncAt] = useState(null);
+  const shaRef = useRef({ history: null, photos: null });
+  const syncReadyRef = useRef(false);
+  const pushTimer = useRef(null);
+  const photoTimer = useRef(null);
+
   // Session timing now lives INSIDE each (date+day) record, so each workout is
   // its own session. These derive the active session for the selected day.
   const currentKey = sessionKey(todayKey(), selectedDay);
@@ -496,6 +505,77 @@ export default function HypertrophyApp() {
   useEffect(() => { if (loaded) window.storage.set('hyp_videos', JSON.stringify(videos)).catch(() => {}); }, [videos, loaded]);
   useEffect(() => { if (loaded) window.storage.set('hyp_bodyweight', JSON.stringify(bodyweightLog)).catch(() => {}); }, [bodyweightLog, loaded]);
   useEffect(() => { if (loaded && restEndAt) window.storage.set('hyp_rest', JSON.stringify({ restEndAt, restTotalSec })).catch(() => {}); }, [restEndAt, restTotalSec, loaded]);
+
+  // --- GitHub sync: pull + merge on load ---
+  useEffect(() => {
+    if (!loaded || !sync.isConfigured()) return;
+    (async () => {
+      setSyncStatus('syncing');
+      try {
+        const local = { settings, history, photos, videos, bodyweightLog, updatedAt: localStorage.getItem('hyp_updatedAt') || '', hasLocal: Object.keys(history).length > 0 };
+        const m = await sync.pullMerge(local);
+        shaRef.current = m.shas;
+        setSettings(prev => ({ ...prev, ...m.settings }));
+        setHistory(m.history); setBodyweightLog(m.bodyweightLog); setVideos(m.videos); setPhotos(m.photos);
+        if (m.localAhead) shaRef.current.history = await sync.pushHistory({ settings: m.settings, history: m.history, bodyweightLog: m.bodyweightLog, videos: m.videos }, m.shas.history);
+        setSyncStatus('synced'); setLastSyncAt(new Date().toISOString());
+      } catch (e) { setSyncStatus(navigator.onLine ? 'error' : 'offline'); }
+      setTimeout(() => { syncReadyRef.current = true; }, 0);
+    })();
+  }, [loaded]);
+
+  // --- push history.json on change (debounced) ---
+  useEffect(() => {
+    if (!syncReadyRef.current || !sync.isConfigured()) return;
+    clearTimeout(pushTimer.current);
+    pushTimer.current = setTimeout(async () => {
+      setSyncStatus('syncing');
+      try {
+        shaRef.current.history = await sync.pushHistory({ settings, history, bodyweightLog, videos }, shaRef.current.history);
+        localStorage.setItem('hyp_updatedAt', new Date().toISOString());
+        setSyncStatus('synced'); setLastSyncAt(new Date().toISOString());
+      } catch (e) { setSyncStatus(navigator.onLine ? 'error' : 'offline'); }
+    }, 2500);
+    return () => clearTimeout(pushTimer.current);
+  }, [history, settings, bodyweightLog, videos]);
+
+  // --- push photos.json on change (debounced; large file, kept separate) ---
+  useEffect(() => {
+    if (!syncReadyRef.current || !sync.isConfigured()) return;
+    clearTimeout(photoTimer.current);
+    photoTimer.current = setTimeout(async () => {
+      try { shaRef.current.photos = await sync.pushPhotos({ photos }, shaRef.current.photos); } catch (e) { /* retried on next change */ }
+    }, 3000);
+    return () => clearTimeout(photoTimer.current);
+  }, [photos]);
+
+  const pullMergePush = async () => {
+    const m = await sync.pullMerge({ settings, history, photos, videos, bodyweightLog, updatedAt: localStorage.getItem('hyp_updatedAt') || '', hasLocal: Object.keys(history).length > 0 });
+    shaRef.current = m.shas;
+    setSettings(prev => ({ ...prev, ...m.settings })); setHistory(m.history); setBodyweightLog(m.bodyweightLog); setVideos(m.videos); setPhotos(m.photos);
+    shaRef.current.history = await sync.pushHistory({ settings: m.settings, history: m.history, bodyweightLog: m.bodyweightLog, videos: m.videos }, m.shas.history);
+    shaRef.current.photos = await sync.pushPhotos({ photos: m.photos }, m.shas.photos);
+    localStorage.setItem('hyp_updatedAt', new Date().toISOString());
+  };
+
+  const saveSyncConfig = async (token, repo) => {
+    sync.setConfig(token, repo);
+    if (!token) { setSyncStatus('off'); return { ok: false, msg: 'Token cleared — sync off.' }; }
+    setSyncStatus('syncing');
+    const res = await sync.testConnection();
+    if (!res.ok) { setSyncStatus('error'); return { ok: false, msg: res.status === 404 ? 'Repo not found — check the name and that the token can see it.' : `Failed (HTTP ${res.status}) — check the token.` }; }
+    if (!res.canWrite) { setSyncStatus('error'); return { ok: false, msg: 'Token works but has no write access — set Contents: Read & Write.' }; }
+    syncReadyRef.current = false;
+    try { await pullMergePush(); setSyncStatus('synced'); setLastSyncAt(new Date().toISOString()); setTimeout(() => { syncReadyRef.current = true; }, 0); return { ok: true, msg: '✓ Connected and synced.' }; }
+    catch (e) { setSyncStatus('error'); return { ok: false, msg: 'Connected but sync failed: ' + e.message }; }
+  };
+
+  const syncNow = async () => {
+    if (!sync.isConfigured()) return;
+    setSyncStatus('syncing');
+    try { await pullMergePush(); setSyncStatus('synced'); setLastSyncAt(new Date().toISOString()); }
+    catch (e) { setSyncStatus(navigator.onLine ? 'error' : 'offline'); }
+  };
 
   useEffect(() => {
     const sessionActive = sessionStart && !sessionEnd;
@@ -794,7 +874,7 @@ export default function HypertrophyApp() {
       <div style={{ position: 'sticky', top: 0, background: '#0a0a0a', borderBottom: '1px solid #1f1f1f', zIndex: 50, padding: '10px 14px 8px' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <img src="/assets/logo.png" alt="" style={{ width: 36, height: 36 }} onError={(e) => { e.target.style.display = 'none'; }} />
+            <img src={`${import.meta.env.BASE_URL}assets/logo.png`} alt="" style={{ width: 36, height: 36 }} onError={(e) => { e.target.style.display = 'none'; }} />
             <div className="display" style={{ fontSize: 22, lineHeight: 1, color: '#facc15' }}>STRONGER EVERY DAY</div>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -806,6 +886,12 @@ export default function HypertrophyApp() {
                   <span style={{ fontSize: 8, opacity: 0.7 }}>since {formatClockTime(sessionStart)}</span>
                 </div>
               </div>
+            )}
+            {syncStatus !== 'off' && (
+              <button onClick={syncNow} title="Sync now" style={{ display: 'flex', alignItems: 'center', gap: 4, background: 'none', padding: '2px 4px' }}>
+                <span style={{ width: 8, height: 8, borderRadius: 4, background: syncStatus === 'synced' ? '#22c55e' : syncStatus === 'syncing' ? '#facc15' : syncStatus === 'offline' ? '#888' : '#ef4444' }} />
+                <span style={{ fontSize: 8, color: '#666', fontWeight: 700 }}>{syncStatus === 'syncing' ? 'SYNC…' : syncStatus === 'synced' ? 'SYNCED' : syncStatus === 'offline' ? 'OFFLINE' : syncStatus === 'error' ? 'SYNC ⚠' : 'SYNC'}</span>
+              </button>
             )}
             <div className="mono" style={{ fontSize: 10, color: '#666' }}>WK {settings.mesoWeek}/6</div>
           </div>
@@ -860,7 +946,7 @@ export default function HypertrophyApp() {
         )}
         {view === 'history' && <HistoryView history={history} photos={photos} onZoom={setZoomPhoto} />}
         {view === 'progress' && <ProgressView history={history} bodyweightLog={bodyweightLog} setBodyweightLog={setBodyweightLog} settings={settings} />}
-        {view === 'settings' && <SettingsView settings={settings} setSettings={setSettings} onExportExcel={exportToExcel} onExportJSON={exportJSON} onImportJSON={importJSON} onImportExcel={importExcel} onBackupNow={manualBackupNow} onRestore={restoreFromClipboard} lastBackup={lastBackup} />}
+        {view === 'settings' && <SettingsView settings={settings} setSettings={setSettings} onExportExcel={exportToExcel} onExportJSON={exportJSON} onImportJSON={importJSON} onImportExcel={importExcel} onBackupNow={manualBackupNow} onRestore={restoreFromClipboard} lastBackup={lastBackup} syncStatus={syncStatus} lastSyncAt={lastSyncAt} onSaveSync={saveSyncConfig} onSyncNow={syncNow} />}
       </div>
 
       {/* BOTTOM NAV */}
@@ -1426,12 +1512,47 @@ function Sparkline({ data }) {
 // SETTINGS VIEW
 // ============================================================
 
-function SettingsView({ settings, setSettings, onExportExcel, onExportJSON, onImportJSON, onImportExcel, onBackupNow, onRestore, lastBackup }) {
+function SyncSettings({ status, lastSyncAt, onSave, onSyncNow }) {
+  const [open, setOpen] = useState(!sync.isConfigured());
+  const [token, setToken] = useState(sync.getToken());
+  const [repo, setRepo] = useState(sync.getRepo());
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null);
+  const save = async () => { setBusy(true); setMsg(null); const r = await onSave(token, repo); setMsg(r); setBusy(false); };
+  const color = status === 'synced' ? '#22c55e' : status === 'syncing' ? '#facc15' : status === 'off' ? '#666' : status === 'offline' ? '#888' : '#ef4444';
+  const label = status === 'synced' ? 'Synced' : status === 'syncing' ? 'Syncing…' : status === 'off' ? 'Not connected' : status === 'offline' ? 'Offline — saved on this device' : status === 'error' ? 'Error' : 'Idle';
+  return (
+    <div style={{ marginBottom: 10, background: '#111', border: '2px solid #2f6fed', borderRadius: 10, padding: 12 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <div style={{ fontSize: 10.5, color: '#60a5fa', fontWeight: 700, letterSpacing: '0.05em', display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ width: 8, height: 8, borderRadius: 4, background: color }} /> ☁ GITHUB SYNC — PHONE + MAC
+        </div>
+        <button onClick={() => setOpen(o => !o)} style={{ background: 'none', color: '#888', fontSize: 10, fontWeight: 700 }}>{open ? 'HIDE' : 'SETUP'}</button>
+      </div>
+      <div style={{ fontSize: 10, color: '#888', marginTop: 4 }}>{label}{lastSyncAt ? ` · last ${new Date(lastSyncAt).toLocaleTimeString()}` : ''}</div>
+      {sync.isConfigured() && <button onClick={onSyncNow} style={{ marginTop: 8, width: '100%', background: '#1a1a1a', color: '#60a5fa', border: '1px solid #2f6fed', padding: 8, borderRadius: 7, fontWeight: 700, fontSize: 11 }}>↻ SYNC NOW</button>}
+      {open && (
+        <div style={{ marginTop: 10 }}>
+          <div style={{ fontSize: 9.5, color: '#888', lineHeight: 1.55, marginBottom: 8 }}>
+            Make a GitHub <b style={{ color: '#ddd' }}>fine-grained token</b> with <b style={{ color: '#ddd' }}>Contents: Read &amp; Write</b> on the <b style={{ color: '#ddd' }}>hypertrophy-data</b> repo only, then paste it below. It's stored only in this browser, never uploaded. <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer" style={{ color: '#60a5fa' }}>Create token →</a>
+          </div>
+          <input type="text" value={repo} onChange={e => setRepo(e.target.value)} placeholder="owner/repo" style={{ width: '100%', background: '#0a0a0a', border: '1px solid #2a2a2a', color: '#f5f5f5', padding: 8, borderRadius: 6, fontSize: 11, fontFamily: 'JetBrains Mono, monospace', marginBottom: 6 }} />
+          <input type="password" value={token} onChange={e => setToken(e.target.value)} placeholder="github_pat_…" autoComplete="off" style={{ width: '100%', background: '#0a0a0a', border: '1px solid #2a2a2a', color: '#f5f5f5', padding: 8, borderRadius: 6, fontSize: 11, fontFamily: 'JetBrains Mono, monospace', marginBottom: 6 }} />
+          <button onClick={save} disabled={busy} style={{ width: '100%', background: '#2f6fed', color: '#fff', padding: 9, borderRadius: 7, fontWeight: 700, fontSize: 11 }}>{busy ? 'CONNECTING…' : 'CONNECT & SYNC'}</button>
+          {msg && <div style={{ marginTop: 7, fontSize: 10, color: msg.ok ? '#22c55e' : '#fca5a5' }}>{msg.msg}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SettingsView({ settings, setSettings, onExportExcel, onExportJSON, onImportJSON, onImportExcel, onBackupNow, onRestore, lastBackup, syncStatus, lastSyncAt, onSaveSync, onSyncNow }) {
   const importRef = useRef(null);
   const excelImportRef = useRef(null);
   return (
     <div>
       <div className="display" style={{ fontSize: 26, color: '#facc15', marginBottom: 12 }}>SETTINGS</div>
+      <SyncSettings status={syncStatus} lastSyncAt={lastSyncAt} onSave={onSaveSync} onSyncNow={onSyncNow} />
       <SettingRow label="UNIT">
         <div style={{ display: 'flex', background: '#0a0a0a', borderRadius: 7, padding: 2, border: '1px solid #2a2a2a' }}>
           {['kg', 'lb'].map(u => (
