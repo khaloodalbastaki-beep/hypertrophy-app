@@ -897,8 +897,8 @@ export default function HypertrophyApp() {
           </div>
         </div>
         {/* DATA STATUS BANNER */}
-        <DataStatusBanner totalSessions={totalSessions} totalSets={totalSets} totalPhotos={totalPhotos} daysSinceBackup={daysSinceBackup} onBackupNow={manualBackupNow} onRestore={restoreFromClipboard} />
-        <DaySelector selected={selectedDay} onSelect={setSelectedDay} />
+        <DataStatusBanner totalSessions={totalSessions} totalSets={totalSets} totalPhotos={totalPhotos} daysSinceBackup={daysSinceBackup} onBackupNow={manualBackupNow} onRestore={restoreFromClipboard} syncOn={syncStatus !== 'off'} />
+        {view === 'today' && <DaySelector selected={selectedDay} onSelect={setSelectedDay} />}
       </div>
 
       {/* REST TIMER OVERLAY */}
@@ -971,8 +971,18 @@ export default function HypertrophyApp() {
 // DATA STATUS BANNER — persistent at top of every screen
 // ============================================================
 
-function DataStatusBanner({ totalSessions, totalSets, totalPhotos, daysSinceBackup, onBackupNow, onRestore }) {
+function DataStatusBanner({ totalSessions, totalSets, totalPhotos, daysSinceBackup, onBackupNow, onRestore, syncOn }) {
   const isStale = daysSinceBackup === null || daysSinceBackup > 7;
+  // When GitHub sync is on, backup is automatic — show a clean synced strip, no manual backup buttons.
+  if (syncOn) {
+    return (
+      <div style={{ background: '#0f1a14', border: '1px solid #1f3a2c', borderRadius: 8, padding: '6px 10px', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
+        <Database size={12} color="#22c55e" />
+        <span className="mono" style={{ fontSize: 10, color: '#ddd', fontWeight: 700 }}>{totalSessions} sessions · {totalSets} sets · {totalPhotos} photos</span>
+        <span style={{ marginLeft: 'auto', fontSize: 9, color: '#6ee7b7', fontWeight: 700 }}>☁ Auto-synced to GitHub</span>
+      </div>
+    );
+  }
   return (
     <div style={{ background: isStale ? '#1a0f00' : '#0f1a0f', border: `1px solid ${isStale ? '#facc15' : '#22c55e'}`, borderRadius: 8, padding: '6px 10px', marginBottom: 8, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 0 }}>
