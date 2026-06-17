@@ -74,6 +74,17 @@ function mergeBodyweight(a, b) {
   const m = {}; [...(a || []), ...(b || [])].forEach((e) => { if (e && e.date) m[e.date] = e; });
   return Object.values(m).sort((x, y) => (x.date < y.date ? -1 : 1));
 }
+// Feedback = append-only list of bug/idea reports written in-app. Union by id so
+// nothing the user typed offline is lost; a 'done' status wins over 'open'; newest first.
+function mergeFeedback(a, b) {
+  const m = {};
+  [...(a || []), ...(b || [])].forEach((e) => {
+    if (!e || !e.id) return;
+    const cur = m[e.id];
+    if (!cur || e.status === 'done') m[e.id] = e;
+  });
+  return Object.values(m).sort((x, y) => ((y.createdAt || '') < (x.createdAt || '') ? -1 : 1));
+}
 
 // Pull both files and return merged data vs the passed-in local state.
 export async function pullMerge(local) {
@@ -82,6 +93,8 @@ export async function pullMerge(local) {
   const remoteNewer = (rH.updatedAt || '') > (local.updatedAt || '');
   const mergedHistory = mergeHistory(local.history, rH.history);
   const mergedBw = mergeBodyweight(local.bodyweightLog, rH.bodyweightLog);
+  const mergedFeedback = mergeFeedback(local.feedback, rH.feedback);
+  const mergedNotes = { ...(rH.notes || {}), ...(local.notes || {}) };
   return {
     shas: { history: h.sha, photos: p.sha },
     settings: rH.settings && (remoteNewer || !local.hasLocal) ? rH.settings : local.settings,
@@ -89,19 +102,30 @@ export async function pullMerge(local) {
     bodyweightLog: mergedBw,
     videos: { ...(rH.videos || {}), ...(local.videos || {}) },
     photos: { ...(rP.photos || {}), ...(local.photos || {}) },
+    feedback: mergedFeedback,
+    notes: mergedNotes,
     remoteExisted: !!h.sha,
-    // local has sessions/bodyweight the remote doesn't yet -> caller should push
-    localAhead: JSON.stringify(mergedHistory) !== JSON.stringify(rH.history || {}) || JSON.stringify(mergedBw) !== JSON.stringify(rH.bodyweightLog || []),
+    // local has sessions/bodyweight/feedback the remote doesn't yet -> caller should push
+    localAhead: JSON.stringify(mergedHistory) !== JSON.stringify(rH.history || {})
+      || JSON.stringify(mergedBw) !== JSON.stringify(rH.bodyweightLog || [])
+      || JSON.stringify(mergedFeedback) !== JSON.stringify(rH.feedback || [])
+      || JSON.stringify(mergedNotes) !== JSON.stringify(rH.notes || {}),
   };
 }
 
 export async function pushHistory(state, sha) {
-  const doc = { version: 5, updatedAt: new Date().toISOString(), settings: state.settings, history: state.history, bodyweightLog: state.bodyweightLog, videos: state.videos };
+  const doc = { version: 5, updatedAt: new Date().toISOString(), settings: state.settings, history: state.history, bodyweightLog: state.bodyweightLog, videos: state.videos, feedback: state.feedback || [], notes: state.notes || {} };
   try { return await putFile('history.json', doc, sha, 'update history'); }
   catch (e) {
     if (!e.conflict) throw e;
     const cur = await getFile('history.json');
-    const merged = { ...doc, history: mergeHistory(state.history, cur.json?.history), bodyweightLog: mergeBodyweight(state.bodyweightLog, cur.json?.bodyweightLog) };
+    const merged = {
+      ...doc,
+      history: mergeHistory(state.history, cur.json?.history),
+      bodyweightLog: mergeBodyweight(state.bodyweightLog, cur.json?.bodyweightLog),
+      feedback: mergeFeedback(state.feedback, cur.json?.feedback),
+      notes: { ...(cur.json?.notes || {}), ...(state.notes || {}) },
+    };
     return await putFile('history.json', merged, cur.sha, 'update history (merged)');
   }
 }

@@ -418,27 +418,92 @@ const compressImage = (file) => new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
       const canvas = document.createElement('canvas');
-      const maxDim = 400;
+      // Bigger + higher quality so the tap-to-zoom lightbox stays sharp (was 400 / 0.7,
+      // which looked blurry zoomed). 1280px @ 0.85 ≈ 150–300 KB per photo — fine for sync.
+      const maxDim = 1280;
       let w = img.width, h = img.height;
       if (w > h) { if (w > maxDim) { h = h * (maxDim / w); w = maxDim; } }
       else { if (h > maxDim) { w = w * (maxDim / h); h = maxDim; } }
-      canvas.width = w; canvas.height = h;
-      canvas.getContext('2d').drawImage(img, 0, 0, w, h);
-      resolve(canvas.toDataURL('image/jpeg', 0.7));
+      canvas.width = Math.round(w); canvas.height = Math.round(h);
+      const ctx = canvas.getContext('2d');
+      ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL('image/jpeg', 0.85));
     };
     img.src = e.target.result;
   };
   reader.readAsDataURL(file);
 });
 
-const suggestWeight = (lastSession, repMin, repMax, rirTarget) => {
-  if (!lastSession || !lastSession.sets || lastSession.sets.length === 0) return null;
-  const sets = lastSession.sets;
-  const allHitTop = sets.every(s => s.reps >= repMax && s.rir >= rirTarget);
-  const lastWeight = sets[sets.length - 1].weight;
-  const unit = sets[sets.length - 1].unit;
-  if (allHitTop) return { weight: lastWeight + (unit === 'kg' ? 2.5 : 5), unit, reason: 'Top of range hit. Add weight.' };
-  return { weight: lastWeight, unit, reason: 'Same weight. Push for more reps.' };
+// ------------------------------------------------------------
+// SMART PROGRESSION  (autoregulated double-progression)
+// ------------------------------------------------------------
+// Rule (hypertrophy-sound, handles the "I lowered the weight" case Khalid asked for):
+//   • Work off the TOP working weight of the LAST session for this exercise.
+//   • Hit the top of the rep range with effort to spare (avg RIR ≤ target) → ADD the
+//     smallest plate and reset to the bottom of the range. (double progression up)
+//   • In range but not at the top → SAME weight, chase +1 rep. (double progression across)
+//   • Below the range → SAME weight, rebuild to the bottom first (never add after a miss).
+//   • If last time the weight was LOWER than the session before (a deload / drop):
+//       – recovered (hit top with reserve) → step *back up* toward the old weight, one
+//         increment at a time (never blind-jump straight back to the old number).
+//       – not recovered → stay light, rebuild reps before going heavier.
+// Returns the suggested first set: { weight, unit, reps, rir, reason, action }.
+const incFor = (unit) => (unit === 'kg' ? 2.5 : 5);
+
+const exerciseSessions = (exercise, history) => Object.keys(history).sort().reverse()
+  .map((k) => ({ date: history[k]?.date || k.split('__')[0], sets: history[k]?.sets?.[exercise.id] }))
+  .filter((e) => e.date !== todayKey() && Array.isArray(e.sets) && e.sets.length);
+
+const smartSuggest = (exercise, history) => {
+  const sessions = exerciseSessions(exercise, history);
+  if (!sessions.length) return null;
+  const last = sessions[0].sets;
+  const prev = sessions[1]?.sets || null;
+  const repMin = exercise.repMin, repMax = exercise.repMax, rirT = exercise.rirMin ?? 1;
+  const unit = last[last.length - 1].unit || 'kg';
+  const inc = incFor(unit);
+
+  // Top working weight of last session + how the sets at that weight went.
+  const topWeight = Math.max(...last.map((s) => s.weight));
+  const workSets = last.filter((s) => s.weight === topWeight);
+  const minReps = Math.min(...workSets.map((s) => s.reps));
+  const maxReps = Math.max(...workSets.map((s) => s.reps));
+  const avgRir = workSets.reduce((a, s) => a + (s.rir ?? 0), 0) / workSets.length;
+
+  const prevTop = prev ? Math.max(...prev.map((s) => s.weight)) : null;
+  const wasLowered = prevTop != null && topWeight < prevTop;
+
+  const atCap = minReps >= repMax;                    // reached the top of the rep range
+  const hitTop = atCap && avgRir <= rirT + 0.5;        // top of range AND taken near enough to failure
+  const recovered = hitTop || avgRir >= rirT + 2;      // top of range, OR clearly easy (reps left to spare)
+  const belowRange = minReps < repMin;                 // couldn't reach the bottom of the range
+
+  // A deload / dropped weight last time → climb back deliberately, never blind-jump.
+  if (wasLowered) {
+    if (recovered) {
+      const target = Math.min(prevTop, topWeight + inc);
+      return { weight: target, unit, reps: repMin, rir: rirT, action: 'stepup',
+        reason: `Felt strong at ${topWeight}${unit} — step back up toward ${prevTop}${unit}.` };
+    }
+    return { weight: topWeight, unit, reps: Math.min(maxReps + 1, repMax), rir: rirT, action: 'rebuild',
+      reason: `Rebuild reps at ${topWeight}${unit} before going heavier.` };
+  }
+  if (hitTop) {
+    return { weight: topWeight + inc, unit, reps: repMin, rir: rirT, action: 'add',
+      reason: `Top of range with effort to spare — add ${inc}${unit}.` };
+  }
+  if (atCap) { // hit the rep cap but left reps in reserve → intensify before loading
+    return { weight: topWeight, unit, reps: repMax, rir: rirT, action: 'intensify',
+      reason: `At ${repMax} reps with ~${Math.round(avgRir)} left — push to RIR ${rirT}, then add weight.` };
+  }
+  if (belowRange) {
+    return { weight: topWeight, unit, reps: repMin, rir: rirT, action: 'hold',
+      reason: `Stay at ${topWeight}${unit} — aim for ${repMin}+ clean reps.` };
+  }
+  const targetReps = Math.min(maxReps + 1, repMax);
+  return { weight: topWeight, unit, reps: targetReps, rir: rirT, action: 'reps',
+    reason: `Same weight — chase ${targetReps} reps.` };
 };
 
 // ============================================================
@@ -452,9 +517,17 @@ export default function HypertrophyApp() {
   const [history, setHistory] = useState({});
   const [photos, setPhotos] = useState({});
   const [videos, setVideos] = useState({});
+  const [notes, setNotes] = useState({});          // per-exercise setup notes (pin #, seat height…)
+  const [feedback, setFeedback] = useState([]);     // in-app bug/idea reports
   const [bodyweightLog, setBodyweightLog] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [lastBackup, setLastBackup] = useState(null);
+
+  // Pointer to the in-progress session {date, day}. Persisted so a workout that
+  // crosses midnight, or is reopened later, resumes the SAME record instead of
+  // starting a new (orphaned) one — the "session lost on reopen" fix.
+  const [activeSession, setActiveSession] = useState(null);
+  const [summaryModal, setSummaryModal] = useState(null); // null | 'confirm' | 'done'
 
   const [restEndAt, setRestEndAt] = useState(null);
   const [restTotalSec, setRestTotalSec] = useState(0);
@@ -473,8 +546,11 @@ export default function HypertrophyApp() {
   const photoTimer = useRef(null);
 
   // Session timing now lives INSIDE each (date+day) record, so each workout is
-  // its own session. These derive the active session for the selected day.
-  const currentKey = sessionKey(todayKey(), selectedDay);
+  // its own session. If a session is in progress for the selected day, use its
+  // FROZEN start date for the key (so logging past midnight, or reopening the app
+  // the next day, keeps writing to the same record instead of orphaning it).
+  const activeForDay = activeSession && activeSession.day === selectedDay ? activeSession : null;
+  const currentKey = sessionKey(activeForDay ? activeForDay.date : todayKey(), selectedDay);
   const currentRec = history[currentKey];
   const sessionStart = currentRec?.startTime || null;
   const sessionEnd = currentRec?.finishedAt || null;
@@ -489,12 +565,20 @@ export default function HypertrophyApp() {
         } catch (e) { return null; }
       };
       const s = await loadKey('hyp_settings'); if (s) setSettings(prev => ({ ...prev, ...s }));
-      const h = await loadKey('hyp_history'); if (h) setHistory(migrateHistory(h));
+      const h = await loadKey('hyp_history'); const migrated = h ? migrateHistory(h) : {}; if (h) setHistory(migrated);
       const p = await loadKey('hyp_photos'); if (p) setPhotos(p);
       const v = await loadKey('hyp_videos'); if (v) setVideos(v);
+      const nt = await loadKey('hyp_notes'); if (nt) setNotes(nt);
+      const fb = await loadKey('hyp_feedback'); if (fb) setFeedback(fb);
       const bw = await loadKey('hyp_bodyweight'); if (bw) setBodyweightLog(bw);
       const rest = await loadKey('hyp_rest'); if (rest && rest.restEndAt && rest.restEndAt > Date.now()) { setRestEndAt(rest.restEndAt); setRestTotalSec(rest.restTotalSec); }
       const lb = await loadKey('hyp_last_backup'); if (lb) setLastBackup(lb);
+      // Resume an in-progress session if one was left open (and it still exists / isn't finished).
+      const as = await loadKey('hyp_active_session');
+      if (as && as.day && as.date) {
+        const rec = migrated[sessionKey(as.date, as.day)];
+        if (rec && !rec.finishedAt) { setActiveSession(as); setSelectedDay(as.day); }
+      }
       setLoaded(true);
     })();
   }, []);
@@ -503,7 +587,14 @@ export default function HypertrophyApp() {
   useEffect(() => { if (loaded) window.storage.set('hyp_history', JSON.stringify(history)).catch(() => {}); }, [history, loaded]);
   useEffect(() => { if (loaded) window.storage.set('hyp_photos', JSON.stringify(photos)).catch(() => {}); }, [photos, loaded]);
   useEffect(() => { if (loaded) window.storage.set('hyp_videos', JSON.stringify(videos)).catch(() => {}); }, [videos, loaded]);
+  useEffect(() => { if (loaded) window.storage.set('hyp_notes', JSON.stringify(notes)).catch(() => {}); }, [notes, loaded]);
+  useEffect(() => { if (loaded) window.storage.set('hyp_feedback', JSON.stringify(feedback)).catch(() => {}); }, [feedback, loaded]);
   useEffect(() => { if (loaded) window.storage.set('hyp_bodyweight', JSON.stringify(bodyweightLog)).catch(() => {}); }, [bodyweightLog, loaded]);
+  useEffect(() => {
+    if (!loaded) return;
+    if (activeSession) window.storage.set('hyp_active_session', JSON.stringify(activeSession)).catch(() => {});
+    else window.storage.delete('hyp_active_session').catch(() => {});
+  }, [activeSession, loaded]);
   useEffect(() => { if (loaded && restEndAt) window.storage.set('hyp_rest', JSON.stringify({ restEndAt, restTotalSec })).catch(() => {}); }, [restEndAt, restTotalSec, loaded]);
 
   // --- GitHub sync: pull + merge on load ---
@@ -512,12 +603,12 @@ export default function HypertrophyApp() {
     (async () => {
       setSyncStatus('syncing');
       try {
-        const local = { settings, history, photos, videos, bodyweightLog, updatedAt: localStorage.getItem('hyp_updatedAt') || '', hasLocal: Object.keys(history).length > 0 };
+        const local = { settings, history, photos, videos, bodyweightLog, feedback, notes, updatedAt: localStorage.getItem('hyp_updatedAt') || '', hasLocal: Object.keys(history).length > 0 };
         const m = await sync.pullMerge(local);
         shaRef.current = m.shas;
         setSettings(prev => ({ ...prev, ...m.settings }));
-        setHistory(m.history); setBodyweightLog(m.bodyweightLog); setVideos(m.videos); setPhotos(m.photos);
-        if (m.localAhead) shaRef.current.history = await sync.pushHistory({ settings: m.settings, history: m.history, bodyweightLog: m.bodyweightLog, videos: m.videos }, m.shas.history);
+        setHistory(m.history); setBodyweightLog(m.bodyweightLog); setVideos(m.videos); setPhotos(m.photos); setFeedback(m.feedback); setNotes(m.notes);
+        if (m.localAhead) shaRef.current.history = await sync.pushHistory({ settings: m.settings, history: m.history, bodyweightLog: m.bodyweightLog, videos: m.videos, feedback: m.feedback, notes: m.notes }, m.shas.history);
         setSyncStatus('synced'); setLastSyncAt(new Date().toISOString());
       } catch (e) { setSyncStatus(navigator.onLine ? 'error' : 'offline'); }
       setTimeout(() => { syncReadyRef.current = true; }, 0);
@@ -531,13 +622,13 @@ export default function HypertrophyApp() {
     pushTimer.current = setTimeout(async () => {
       setSyncStatus('syncing');
       try {
-        shaRef.current.history = await sync.pushHistory({ settings, history, bodyweightLog, videos }, shaRef.current.history);
+        shaRef.current.history = await sync.pushHistory({ settings, history, bodyweightLog, videos, feedback, notes }, shaRef.current.history);
         localStorage.setItem('hyp_updatedAt', new Date().toISOString());
         setSyncStatus('synced'); setLastSyncAt(new Date().toISOString());
       } catch (e) { setSyncStatus(navigator.onLine ? 'error' : 'offline'); }
     }, 2500);
     return () => clearTimeout(pushTimer.current);
-  }, [history, settings, bodyweightLog, videos]);
+  }, [history, settings, bodyweightLog, videos, feedback, notes]);
 
   // --- push photos.json on change (debounced; large file, kept separate) ---
   useEffect(() => {
@@ -550,10 +641,10 @@ export default function HypertrophyApp() {
   }, [photos]);
 
   const pullMergePush = async () => {
-    const m = await sync.pullMerge({ settings, history, photos, videos, bodyweightLog, updatedAt: localStorage.getItem('hyp_updatedAt') || '', hasLocal: Object.keys(history).length > 0 });
+    const m = await sync.pullMerge({ settings, history, photos, videos, bodyweightLog, feedback, notes, updatedAt: localStorage.getItem('hyp_updatedAt') || '', hasLocal: Object.keys(history).length > 0 });
     shaRef.current = m.shas;
-    setSettings(prev => ({ ...prev, ...m.settings })); setHistory(m.history); setBodyweightLog(m.bodyweightLog); setVideos(m.videos); setPhotos(m.photos);
-    shaRef.current.history = await sync.pushHistory({ settings: m.settings, history: m.history, bodyweightLog: m.bodyweightLog, videos: m.videos }, m.shas.history);
+    setSettings(prev => ({ ...prev, ...m.settings })); setHistory(m.history); setBodyweightLog(m.bodyweightLog); setVideos(m.videos); setPhotos(m.photos); setFeedback(m.feedback); setNotes(m.notes);
+    shaRef.current.history = await sync.pushHistory({ settings: m.settings, history: m.history, bodyweightLog: m.bodyweightLog, videos: m.videos, feedback: m.feedback, notes: m.notes }, m.shas.history);
     shaRef.current.photos = await sync.pushPhotos({ photos: m.photos }, m.shas.photos);
     localStorage.setItem('hyp_updatedAt', new Date().toISOString());
   };
@@ -622,39 +713,56 @@ export default function HypertrophyApp() {
     window.storage.delete('hyp_rest').catch(() => {});
   };
 
+  // Key for a day, honouring an in-progress session's frozen date.
+  const keyForDay = (day) => {
+    const a = activeSession && activeSession.day === day ? activeSession : null;
+    return sessionKey(a ? a.date : todayKey(), day);
+  };
+
   const startSession = () => {
-    const k = sessionKey(todayKey(), selectedDay);
+    const date = todayKey();
+    const k = sessionKey(date, selectedDay);
     const now = new Date().toISOString();
     setHistory(prev => {
-      const rec = prev[k] || { date: todayKey(), day: selectedDay, sets: {} };
+      const rec = prev[k] || { date, day: selectedDay, sets: {} };
       return { ...prev, [k]: { ...rec, startTime: rec.startTime || now, finishedAt: null } };
     });
+    setActiveSession({ date, day: selectedDay });
   };
-  const endSession = () => {
-    const k = sessionKey(todayKey(), selectedDay);
+  // END button -> open the summary/confirm sheet (does NOT finalise yet).
+  const requestEndSession = () => setSummaryModal('confirm');
+  // Actually finish: stamp finishedAt, clear the active pointer, show the "done" summary.
+  const confirmEndSession = () => {
+    const k = keyForDay(selectedDay);
+    const now = new Date().toISOString();
     setHistory(prev => {
       const rec = prev[k];
       if (!rec) return prev;
-      return { ...prev, [k]: { ...rec, finishedAt: new Date().toISOString() } };
+      return { ...prev, [k]: { ...rec, finishedAt: now, endTime: rec.endTime || now } };
     });
+    setActiveSession(null);
+    setSummaryModal('done');
     autoBackupToClipboard();
   };
   // Re-open a finished session (e.g. to add a forgotten set).
   const resetSession = () => {
-    const k = sessionKey(todayKey(), selectedDay);
+    const k = keyForDay(selectedDay);
     setHistory(prev => {
       const rec = prev[k];
       if (!rec) return prev;
       return { ...prev, [k]: { ...rec, finishedAt: null } };
     });
+    setActiveSession({ date: currentRec?.date || todayKey(), day: selectedDay });
   };
 
   const logSet = (exerciseId, exerciseName, totalSets, setData) => {
-    const k = sessionKey(todayKey(), selectedDay);
+    const active = activeSession && activeSession.day === selectedDay ? activeSession : null;
+    const date = active ? active.date : todayKey();
+    const k = sessionKey(date, selectedDay);
     const now = new Date().toISOString();
     let newSetNumber = 1;
     setHistory(prev => {
-      const rec = prev[k] || { date: todayKey(), day: selectedDay, sets: {}, startTime: now };
+      const rec = prev[k] || { date, day: selectedDay, sets: {}, startTime: now };
       const sets = rec.sets[exerciseId] || [];
       newSetNumber = sets.length + 1;
       return {
@@ -668,11 +776,12 @@ export default function HypertrophyApp() {
         },
       };
     });
+    if (!active) setActiveSession({ date, day: selectedDay });
     setToast({ exerciseName, setNumber: newSetNumber, totalSets, type: 'log' });
   };
 
   const undoLastSet = (exerciseId) => {
-    const k = sessionKey(todayKey(), selectedDay);
+    const k = keyForDay(selectedDay);
     setHistory(prev => {
       const rec = prev[k];
       if (!rec || !rec.sets[exerciseId]) return prev;
@@ -684,11 +793,18 @@ export default function HypertrophyApp() {
 
   const setPhoto = (exId, url) => setPhotos(p => ({ ...p, [exId]: url }));
   const setVideoUrl = (exId, url) => setVideos(v => ({ ...v, [exId]: url }));
+  const setNote = (exId, text) => setNotes(n => { const next = { ...n }; if (text && text.trim()) next[exId] = text; else delete next[exId]; return next; });
+  const addFeedback = (text, page) => {
+    const entry = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 7), text: text.trim(), createdAt: new Date().toISOString(), status: 'open', page: page || '' };
+    setFeedback(f => [entry, ...f]);
+    setToast({ type: 'backup', message: '✓ Sent — it syncs to your trainer’s inbox.' });
+  };
+  const removeFeedback = (id) => setFeedback(f => f.filter(e => e.id !== id));
 
   const buildBackupJSON = () => JSON.stringify({
     version: 5,
     exportedAt: new Date().toISOString(),
-    settings, history, photos, videos, bodyweightLog,
+    settings, history, photos, videos, bodyweightLog, notes, feedback,
   });
 
   const autoBackupToClipboard = async () => {
@@ -728,6 +844,8 @@ export default function HypertrophyApp() {
       if (data.history) setHistory(migrateHistory(data.history));
       if (data.photos) setPhotos(data.photos);
       if (data.videos) setVideos(data.videos);
+      if (data.notes) setNotes(data.notes);
+      if (data.feedback) setFeedback(data.feedback);
       if (data.bodyweightLog) setBodyweightLog(data.bodyweightLog);
       alert(`✓ Restored ${Object.keys(data.history).length} sessions from clipboard`);
     } catch (e) {
@@ -779,6 +897,8 @@ export default function HypertrophyApp() {
         if (data.history) setHistory(migrateHistory(data.history));
         if (data.photos) setPhotos(data.photos);
         if (data.videos) setVideos(data.videos);
+        if (data.notes) setNotes(data.notes);
+        if (data.feedback) setFeedback(data.feedback);
         if (data.bodyweightLog) setBodyweightLog(data.bodyweightLog);
         alert(`✓ Restored from ${data.exportedAt || 'backup'}`);
       } catch (err) { alert('Invalid backup file'); }
@@ -864,6 +984,7 @@ export default function HypertrophyApp() {
         .mono { font-family: 'JetBrains Mono', monospace; }
         button { font-family: inherit; cursor: pointer; border: none; }
         input { font-family: inherit; }
+        input::placeholder { color: #5a5a5a; font-weight: 700; opacity: 1; }
         ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
         @keyframes slideIn { from { transform: translateY(100%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
@@ -938,16 +1059,22 @@ export default function HypertrophyApp() {
       <div style={{ padding: '12px 14px' }}>
         {view === 'today' && (
           <TodayView day={currentDayData} dayKey={selectedDay} settings={settings} history={history}
-            todayHistory={todayHistory} photos={photos} videos={videos}
-            onLogSet={logSet} onUndo={undoLastSet} onPhoto={setPhoto} onVideo={setVideoUrl}
+            todayHistory={todayHistory} photos={photos} videos={videos} notes={notes}
+            onLogSet={logSet} onUndo={undoLastSet} onPhoto={setPhoto} onVideo={setVideoUrl} onNote={setNote}
             onStartRest={startRest} setSettings={setSettings} onZoom={setZoomPhoto}
-            sessionStart={sessionStart} sessionEnd={sessionEnd}
-            onStartSession={startSession} onEndSession={endSession} onResetSession={resetSession} />
+            sessionStart={sessionStart} sessionEnd={sessionEnd} sessionElapsed={sessionElapsed}
+            onStartSession={startSession} onEndSession={requestEndSession} onResetSession={resetSession} />
         )}
         {view === 'history' && <HistoryView history={history} photos={photos} onZoom={setZoomPhoto} />}
         {view === 'progress' && <ProgressView history={history} bodyweightLog={bodyweightLog} setBodyweightLog={setBodyweightLog} settings={settings} />}
-        {view === 'settings' && <SettingsView settings={settings} setSettings={setSettings} onExportExcel={exportToExcel} onExportJSON={exportJSON} onImportJSON={importJSON} onImportExcel={importExcel} onBackupNow={manualBackupNow} onRestore={restoreFromClipboard} lastBackup={lastBackup} syncStatus={syncStatus} lastSyncAt={lastSyncAt} onSaveSync={saveSyncConfig} onSyncNow={syncNow} />}
+        {view === 'settings' && <SettingsView settings={settings} setSettings={setSettings} onExportExcel={exportToExcel} onExportJSON={exportJSON} onImportJSON={importJSON} onImportExcel={importExcel} onBackupNow={manualBackupNow} onRestore={restoreFromClipboard} lastBackup={lastBackup} syncStatus={syncStatus} lastSyncAt={lastSyncAt} onSaveSync={saveSyncConfig} onSyncNow={syncNow} feedback={feedback} onAddFeedback={addFeedback} onRemoveFeedback={removeFeedback} />}
       </div>
+
+      {/* SESSION SUMMARY / FINISH SHEET */}
+      {summaryModal && (
+        <SessionSummary mode={summaryModal} rec={currentRec} day={currentDayData} settings={settings}
+          onConfirm={confirmEndSession} onClose={() => setSummaryModal(null)} />
+      )}
 
       {/* BOTTOM NAV */}
       <div style={{ position: 'fixed', bottom: 0, left: 0, right: 0, background: '#0a0a0a', borderTop: '1px solid #1f1f1f', display: 'flex', justifyContent: 'space-around', padding: '10px 0 14px', zIndex: 50 }}>
@@ -1029,7 +1156,7 @@ function DaySelector({ selected, onSelect }) {
 // TODAY VIEW
 // ============================================================
 
-function TodayView({ day, dayKey, settings, history, todayHistory, photos, videos, onLogSet, onUndo, onPhoto, onVideo, onStartRest, setSettings, onZoom, sessionStart, sessionEnd, onStartSession, onEndSession, onResetSession }) {
+function TodayView({ day, dayKey, settings, history, todayHistory, photos, videos, notes, onLogSet, onUndo, onPhoto, onVideo, onNote, onStartRest, setSettings, onZoom, sessionStart, sessionEnd, sessionElapsed, onStartSession, onEndSession, onResetSession }) {
   const [warmupOpen, setWarmupOpen] = useState(false);
   const [rirInfoOpen, setRirInfoOpen] = useState(false);
 
@@ -1042,6 +1169,22 @@ function TodayView({ day, dayKey, settings, history, todayHistory, photos, video
         </div>
         <SessionControl sessionStart={sessionStart} sessionEnd={sessionEnd} onStart={onStartSession} onEnd={onEndSession} onReset={onResetSession} />
       </div>
+
+      {sessionEnd && (() => {
+        const stats = sessionStats(todayHistory, day);
+        return (
+          <div style={{ background: 'linear-gradient(135deg,#0f1f14,#111)', border: '1px solid #22c55e', borderRadius: 12, padding: '12px 14px', marginBottom: 12 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <div style={{ width: 30, height: 30, borderRadius: 15, background: '#22c55e', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}><Check size={18} color="#0a0a0a" strokeWidth={3} /></div>
+              <div>
+                <div className="display" style={{ fontSize: 20, color: '#22c55e', lineHeight: 1 }}>WORKOUT COMPLETE</div>
+                <div style={{ fontSize: 11, color: '#9ca3af', marginTop: 2 }}>{stats.durationMin} min · {stats.exDone}/{stats.exTotal} exercises · {stats.setCount} sets · {stats.volume.toLocaleString()} {settings.unit} moved</div>
+              </div>
+            </div>
+            <div style={{ fontSize: 10.5, color: '#6b7280', marginTop: 8 }}>Tap <strong style={{ color: '#9ca3af' }}>DONE ✓</strong> above to re-open and add a forgotten set.</div>
+          </div>
+        );
+      })()}
 
       <button onClick={() => setRirInfoOpen(!rirInfoOpen)} style={{ width: '100%', background: '#161616', border: '1px solid #2a2a2a', padding: '8px 10px', borderRadius: 8, color: '#facc15', fontSize: 10, fontWeight: 700, display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
         <Info size={12} />
@@ -1067,9 +1210,9 @@ function TodayView({ day, dayKey, settings, history, todayHistory, photos, video
       <div style={{ marginTop: 12 }}>
         {day.exercises.map((ex, idx) => (
           <ExerciseCard key={ex.id + idx} index={idx + 1} exercise={ex} settings={settings} history={history}
-            todaysets={todayHistory.sets[ex.id] || []} photo={photos[ex.id]} customVideo={videos[ex.id]}
+            todaysets={todayHistory.sets[ex.id] || []} photo={photos[ex.id]} customVideo={videos[ex.id]} note={notes?.[ex.id]}
             onLogSet={(setData) => onLogSet(ex.id, ex.name, ex.sets, setData)} onUndo={() => onUndo(ex.id)}
-            onPhoto={(url) => onPhoto(ex.id, url)} onVideoUpdate={(url) => onVideo(ex.id, url)} onZoom={onZoom}
+            onPhoto={(url) => onPhoto(ex.id, url)} onVideoUpdate={(url) => onVideo(ex.id, url)} onNote={(t) => onNote(ex.id, t)} onZoom={onZoom}
             onStartRest={() => onStartRest(ex.rest)} />
         ))}
       </div>
@@ -1078,9 +1221,84 @@ function TodayView({ day, dayKey, settings, history, todayHistory, photos, video
 }
 
 function SessionControl({ sessionStart, sessionEnd, onStart, onEnd, onReset }) {
-  if (sessionStart && !sessionEnd) return <button onClick={onEnd} style={{ background: '#ef4444', color: '#fff', padding: '7px 11px', borderRadius: 7, fontWeight: 700, fontSize: 11, display: 'flex', alignItems: 'center', gap: 5 }}><Square size={12} /> END</button>;
+  if (sessionStart && !sessionEnd) return <button onClick={onEnd} style={{ background: '#ef4444', color: '#fff', padding: '7px 11px', borderRadius: 7, fontWeight: 700, fontSize: 11, display: 'flex', alignItems: 'center', gap: 5 }}><Square size={12} /> FINISH</button>;
   if (sessionEnd) return <button onClick={onReset} style={{ background: '#1a1a1a', color: '#888', padding: '7px 11px', borderRadius: 7, fontWeight: 700, fontSize: 11, border: '1px solid #2a2a2a' }}>DONE ✓</button>;
   return <button onClick={onStart} style={{ background: '#22c55e', color: '#0a0a0a', padding: '7px 11px', borderRadius: 7, fontWeight: 700, fontSize: 11, display: 'flex', alignItems: 'center', gap: 5 }}><Play size={12} /> START</button>;
+}
+
+// ------------------------------------------------------------
+// Session stats (used by the finish sheet + the "complete" banner)
+// ------------------------------------------------------------
+function sessionStats(rec, day) {
+  const sets = rec?.sets || {};
+  const exTotal = (day?.exercises || []).length;
+  const exDone = (day?.exercises || []).filter(ex => (sets[ex.id]?.length || 0) >= ex.sets).length;
+  let setCount = 0, volume = 0;
+  Object.values(sets).forEach(arr => (arr || []).forEach(s => {
+    setCount += 1;
+    const mult = s.weightMode === 'perSide' ? 2 : 1;
+    volume += (Number(s.weight) || 0) * mult * (Number(s.reps) || 0);
+  }));
+  const start = rec?.startTime ? new Date(rec.startTime) : null;
+  const end = rec?.finishedAt ? new Date(rec.finishedAt) : (rec?.endTime ? new Date(rec.endTime) : new Date());
+  const durationMin = start ? Math.max(0, Math.round((end - start) / 60000)) : 0;
+  return { exTotal, exDone, setCount, volume: Math.round(volume), durationMin };
+}
+
+// ------------------------------------------------------------
+// FINISH SHEET — confirm + celebrate the end of a workout
+// ------------------------------------------------------------
+function SessionSummary({ mode, rec, day, settings, onConfirm, onClose }) {
+  const s = sessionStats(rec, day);
+  const done = mode === 'done';
+  const exLines = (day?.exercises || []).map(ex => ({ name: ex.name, n: rec?.sets?.[ex.id]?.length || 0, target: ex.sets }));
+  return (
+    <div onClick={done ? onClose : undefined} style={{ position: 'fixed', inset: 0, zIndex: 320, background: 'rgba(0,0,0,0.75)', display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ width: '100%', maxWidth: 460, background: '#0f0f0f', borderTop: '1px solid #2a2a2a', borderTopLeftRadius: 18, borderTopRightRadius: 18, padding: '18px 16px 24px', boxShadow: '0 -10px 40px rgba(0,0,0,0.6)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+          <div style={{ width: 36, height: 36, borderRadius: 18, background: done ? '#22c55e' : '#facc15', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+            {done ? <Check size={20} color="#0a0a0a" strokeWidth={3} /> : <Square size={16} color="#0a0a0a" />}
+          </div>
+          <div>
+            <div className="display" style={{ fontSize: 24, color: done ? '#22c55e' : '#facc15', lineHeight: 1 }}>{done ? 'WORKOUT COMPLETE' : 'FINISH WORKOUT?'}</div>
+            <div style={{ fontSize: 11, color: '#888', marginTop: 3 }}>{day?.label}: {day?.name}</div>
+          </div>
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 8, marginBottom: 14 }}>
+          {[
+            { v: `${s.durationMin}`, u: 'MIN' },
+            { v: `${s.exDone}/${s.exTotal}`, u: 'EXERCISES' },
+            { v: `${s.setCount}`, u: 'SETS' },
+            { v: s.volume.toLocaleString(), u: settings.unit.toUpperCase() },
+          ].map((b, i) => (
+            <div key={i} style={{ background: '#161616', border: '1px solid #242424', borderRadius: 9, padding: '9px 4px', textAlign: 'center' }}>
+              <div className="mono" style={{ fontSize: 16, fontWeight: 700, color: '#f5f5f5', lineHeight: 1 }}>{b.v}</div>
+              <div style={{ fontSize: 7.5, color: '#777', fontWeight: 700, letterSpacing: '0.06em', marginTop: 3 }}>{b.u}</div>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ background: '#0a0a0a', border: '1px solid #1c1c1c', borderRadius: 9, padding: '8px 10px', marginBottom: 16, maxHeight: 150, overflowY: 'auto' }}>
+          {exLines.map((l, i) => (
+            <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '3px 0', fontSize: 11 }}>
+              <span style={{ color: l.n >= l.target ? '#ddd' : '#777' }}>{l.name}</span>
+              <span className="mono" style={{ fontSize: 10, color: l.n >= l.target ? '#22c55e' : '#666' }}>{l.n}/{l.target}{l.n >= l.target ? ' ✓' : ''}</span>
+            </div>
+          ))}
+        </div>
+
+        {done ? (
+          <button onClick={onClose} style={{ width: '100%', background: '#22c55e', color: '#0a0a0a', padding: 13, borderRadius: 10, fontWeight: 700, fontSize: 13 }}>DONE</button>
+        ) : (
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button onClick={onClose} style={{ flex: 1, background: '#1a1a1a', color: '#aaa', border: '1px solid #2a2a2a', padding: 13, borderRadius: 10, fontWeight: 700, fontSize: 12 }}>KEEP TRAINING</button>
+            <button onClick={onConfirm} style={{ flex: 1.3, background: '#22c55e', color: '#0a0a0a', padding: 13, borderRadius: 10, fontWeight: 700, fontSize: 12 }}>FINISH & SAVE</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
 function CollapsibleSection({ open, setOpen, icon, title, children }) {
@@ -1120,43 +1338,41 @@ function WarmupContent({ mobility }) {
 // EXERCISE CARD
 // ============================================================
 
-function ExerciseCard({ index, exercise, settings, history, todaysets, photo, customVideo, onLogSet, onUndo, onPhoto, onVideoUpdate, onStartRest, onZoom }) {
+function ExerciseCard({ index, exercise, settings, history, todaysets, photo, customVideo, note, onLogSet, onUndo, onPhoto, onVideoUpdate, onNote, onStartRest, onZoom }) {
   const [expanded, setExpanded] = useState(false);
   const [editingVideo, setEditingVideo] = useState(false);
   const [videoInput, setVideoInput] = useState('');
+  const [editingNote, setEditingNote] = useState(false);
+  const [noteInput, setNoteInput] = useState('');
+  // Inputs start EMPTY — last/suggested numbers show only as grey placeholders, never
+  // as real pre-filled values, so today's actual numbers are always entered fresh.
   const [weight, setWeight] = useState('');
   const [reps, setReps] = useState('');
-  const [rir, setRir] = useState(1);
+  const [rir, setRir] = useState(null);
   const fileRef = useRef(null);
 
-  const lastSession = (() => {
-    const keys = Object.keys(history).sort().reverse();
-    for (const k of keys) {
-      if (history[k]?.date === todayKey()) continue; // skip today's sessions
-      if (history[k].sets?.[exercise.id]?.length) return { date: history[k].date || k.split('__')[0], sets: history[k].sets[exercise.id] };
-    }
-    return null;
-  })();
+  const past = exerciseSessions(exercise, history);
+  const lastSession = past[0] ? { date: past[0].date, sets: past[0].sets } : null;
+  const suggestion = smartSuggest(exercise, history);
 
-  const suggestion = suggestWeight(lastSession, exercise.repMin, exercise.repMax, exercise.rirMin);
-
-  // Pre-fill the weight: from your last logged session if available, otherwise
-  // from the program's seeded starting weight (your real numbers).
-  useEffect(() => {
-    if (weight !== '' || reps !== '') return;
-    if (suggestion) {
-      const w = suggestion.unit === settings.unit ? suggestion.weight : (suggestion.unit === 'kg' ? kgToLb(suggestion.weight) : lbToKg(suggestion.weight));
-      setWeight(w); setReps(exercise.repMin); setRir(exercise.rirMin);
-    } else if (exercise.startWeight != null) {
-      setWeight(exercise.startWeight || ''); setReps(exercise.repMin); setRir(exercise.rirMin);
-    }
-  }, [lastSession?.date, exercise.id]);
+  // Reference values for the GREY placeholders (not real input values):
+  // within a session, mirror the set you just did; otherwise the smart suggestion;
+  // otherwise the program's seeded starting weight.
+  const convW = (w, u) => (u === settings.unit ? w : (u === 'kg' ? kgToLb(w) : lbToKg(w)));
+  const roundPh = (n) => (typeof n === 'number' ? Math.round(n * 10) / 10 : n);
+  const lastThis = todaysets[todaysets.length - 1] || null;
+  const ph = lastThis
+    ? { weight: roundPh(convW(lastThis.weight, lastThis.unit)), reps: lastThis.reps, rir: lastThis.rir }
+    : suggestion
+      ? { weight: roundPh(convW(suggestion.weight, suggestion.unit)), reps: suggestion.reps, rir: suggestion.rir }
+      : { weight: exercise.startWeight ?? null, reps: exercise.repMin, rir: exercise.rirMin };
 
   const completedSets = todaysets.length;
   const currentSetNumber = Math.min(completedSets + 1, exercise.sets);
   const isComplete = completedSets >= exercise.sets;
   const details = EXERCISE_DETAILS[exercise.id];
   const videoUrl = customVideo || `https://www.youtube.com/results?search_query=${encodeURIComponent(exercise.name + ' jeff nippard form')}`;
+  const canLog = weight !== '' && reps !== '' && rir != null;
 
   const handlePhoto = async (e) => {
     const file = e.target.files?.[0];
@@ -1165,10 +1381,21 @@ function ExerciseCard({ index, exercise, settings, history, todaysets, photo, cu
   };
 
   const handleLog = () => {
-    if (!weight || !reps) return;
+    if (!canLog) return;
     onLogSet({ weight: parseFloat(weight), unit: settings.unit, reps: parseInt(reps), rir: parseInt(rir), weightMode: exercise.weightMode });
     onStartRest();
+    setWeight(''); setReps(''); setRir(null); // reset so the next set starts on grey placeholders again
   };
+
+  // One-tap accept of the suggested numbers (fills the inputs with real values).
+  const fillSuggestion = () => {
+    if (ph.weight != null) setWeight(String(ph.weight));
+    if (ph.reps != null) setReps(String(ph.reps));
+    setRir(ph.rir != null ? ph.rir : (exercise.rirMin ?? 1));
+  };
+
+  const startEditNote = () => { setNoteInput(note || ''); setEditingNote(true); };
+  const saveNote = () => { onNote?.(noteInput); setEditingNote(false); };
 
   const saveVideo = () => {
     onVideoUpdate(videoInput.trim() || '');
@@ -1215,10 +1442,36 @@ function ExerciseCard({ index, exercise, settings, history, todaysets, photo, cu
               <span style={{ color: '#666' }}>LAST ({lastSession.date}):</span>{' '}
               <span className="mono" style={{ color: '#ccc' }}>{lastSession.sets.map(s => `${s.weight}${s.weightMode === 'perSide' ? '×2' : ''}${s.unit}×${s.reps}`).join(' · ')}</span>
             </div>
-            {suggestion && <div style={{ color: '#facc15', fontWeight: 700, marginTop: 2 }}>→ Try: {suggestion.weight} {suggestion.unit} ({suggestion.reason})</div>}
+            {suggestion && !isComplete && (
+              <button onClick={fillSuggestion} title="Tap to fill these numbers" style={{ marginTop: 4, width: '100%', textAlign: 'left', background: '#1c1908', border: '1px solid #3d3410', borderRadius: 5, padding: '4px 7px', color: '#facc15', fontWeight: 700, fontSize: 10, lineHeight: 1.4 }}>
+                → Target: {roundPh(convW(suggestion.weight, suggestion.unit))} {settings.unit} × {suggestion.reps} @ RIR {suggestion.rir}
+                <span style={{ display: 'block', color: '#a89a4a', fontWeight: 400, fontSize: 9 }}>{suggestion.reason} · tap to fill</span>
+              </button>
+            )}
           </div>
         </div>
       )}
+
+      {/* SETUP NOTES — machine pin #, seat/handle height, position, etc. */}
+      <div style={{ padding: '0 11px 8px' }}>
+        {editingNote ? (
+          <div style={{ background: '#0a0a0a', border: '1px solid #2a2a2a', borderRadius: 7, padding: 7 }}>
+            <textarea value={noteInput} onChange={e => setNoteInput(e.target.value)} autoFocus rows={2} placeholder="e.g. Pin 7 · seat height 4 · handles middle notch" style={{ width: '100%', background: 'transparent', border: 'none', color: '#f5f5f5', fontSize: 11, lineHeight: 1.5, resize: 'vertical', outline: 'none', fontFamily: 'inherit' }} />
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6, marginTop: 4 }}>
+              <button onClick={() => setEditingNote(false)} style={{ background: 'none', color: '#777', fontSize: 10, fontWeight: 700, padding: '4px 8px' }}>CANCEL</button>
+              <button onClick={saveNote} style={{ background: '#facc15', color: '#0a0a0a', fontSize: 10, fontWeight: 700, padding: '4px 10px', borderRadius: 5 }}>SAVE</button>
+            </div>
+          </div>
+        ) : note ? (
+          <button onClick={startEditNote} style={{ width: '100%', textAlign: 'left', background: '#11160f', border: '1px solid #243018', borderRadius: 7, padding: '6px 9px', color: '#bfe3a0', fontSize: 11, lineHeight: 1.45, display: 'flex', gap: 6, alignItems: 'flex-start' }}>
+            <span style={{ flexShrink: 0 }}>📝</span><span style={{ whiteSpace: 'pre-wrap' }}>{note}</span><Edit3 size={11} color="#5e7a48" style={{ marginLeft: 'auto', flexShrink: 0 }} />
+          </button>
+        ) : (
+          <button onClick={startEditNote} style={{ width: '100%', textAlign: 'left', background: 'none', border: '1px dashed #2a2a2a', borderRadius: 7, padding: '5px 9px', color: '#666', fontSize: 10, fontWeight: 700, display: 'flex', alignItems: 'center', gap: 5 }}>
+            <Edit3 size={10} /> Add setup notes — pin #, seat / handle height, position
+          </button>
+        )}
+      </div>
 
       <div style={{ height: 3, background: '#1a1a1a' }}>
         <div style={{ height: '100%', width: `${(completedSets / exercise.sets) * 100}%`, background: isComplete ? '#22c55e' : '#facc15', transition: 'width 0.3s' }} />
@@ -1232,15 +1485,15 @@ function ExerciseCard({ index, exercise, settings, history, todaysets, photo, cu
             </span>
           </div>
           <div style={{ padding: 10, display: 'flex', alignItems: 'center', gap: 5 }}>
-            <NumInput value={weight} onChange={setWeight} placeholder={settings.unit} step={2.5} hint={exercise.weightMode === 'perSide' ? '/side' : ''} />
+            <NumInput value={weight} onChange={setWeight} placeholder={ph.weight != null ? String(ph.weight) : settings.unit} step={2.5} hint={exercise.weightMode === 'perSide' ? '/side' : ''} />
             <span style={{ color: '#444', fontSize: 13 }}>×</span>
-            <NumInput value={reps} onChange={setReps} placeholder="reps" step={1} small />
-            <button onClick={handleLog} disabled={!weight || !reps} style={{ background: weight && reps ? '#facc15' : '#1a1a1a', color: weight && reps ? '#0a0a0a' : '#444', padding: '9px 11px', borderRadius: 7, fontWeight: 700, fontSize: 11 }}>LOG</button>
+            <NumInput value={reps} onChange={setReps} placeholder={ph.reps != null ? String(ph.reps) : 'reps'} step={1} small />
+            <button onClick={handleLog} disabled={!canLog} style={{ background: canLog ? '#facc15' : '#1a1a1a', color: canLog ? '#0a0a0a' : '#444', padding: '9px 11px', borderRadius: 7, fontWeight: 700, fontSize: 11 }}>LOG</button>
           </div>
           <div style={{ padding: '0 10px 7px', display: 'flex', alignItems: 'center', gap: 7 }}>
             <span style={{ fontSize: 9, color: '#888', fontWeight: 700, letterSpacing: '0.05em' }}>RIR:</span>
-            <RIRSelect value={rir} onChange={setRir} />
-            <span style={{ fontSize: 9, color: '#555' }}>(reps left)</span>
+            <RIRSelect value={rir} onChange={setRir} ghost={ph.rir} />
+            <span style={{ fontSize: 9, color: '#555' }}>{rir == null ? 'tap reps left' : '(reps left)'}</span>
           </div>
           {weight && (
             <div style={{ padding: '0 10px 7px', fontSize: 10, color: '#666', display: 'flex', justifyContent: 'space-between' }}>
@@ -1369,12 +1622,16 @@ function NumInput({ value, onChange, placeholder, step = 1, hint, small }) {
   );
 }
 
-function RIRSelect({ value, onChange }) {
+function RIRSelect({ value, onChange, ghost }) {
   return (
     <div style={{ display: 'flex', background: '#0a0a0a', borderRadius: 7, border: '1px solid #2a2a2a', padding: 2 }}>
-      {[0, 1, 2, 3].map(n => (
-        <button key={n} onClick={() => onChange(n)} style={{ background: value === n ? '#facc15' : 'transparent', color: value === n ? '#0a0a0a' : '#888', width: 26, height: 28, borderRadius: 4, fontSize: 11, fontWeight: 700 }}>{n}</button>
-      ))}
+      {[0, 1, 2, 3].map(n => {
+        const selected = value === n;
+        const isGhost = value == null && ghost === n; // suggested value, shown faint until tapped
+        return (
+          <button key={n} onClick={() => onChange(n)} style={{ background: selected ? '#facc15' : 'transparent', color: selected ? '#0a0a0a' : isGhost ? '#7a6a1f' : '#888', border: isGhost ? '1px dashed #4d4416' : '1px solid transparent', width: 26, height: 28, borderRadius: 4, fontSize: 11, fontWeight: 700 }}>{n}</button>
+        );
+      })}
     </div>
   );
 }
@@ -1556,12 +1813,13 @@ function SyncSettings({ status, lastSyncAt, onSave, onSyncNow }) {
   );
 }
 
-function SettingsView({ settings, setSettings, onExportExcel, onExportJSON, onImportJSON, onImportExcel, onBackupNow, onRestore, lastBackup, syncStatus, lastSyncAt, onSaveSync, onSyncNow }) {
+function SettingsView({ settings, setSettings, onExportExcel, onExportJSON, onImportJSON, onImportExcel, onBackupNow, onRestore, lastBackup, syncStatus, lastSyncAt, onSaveSync, onSyncNow, feedback, onAddFeedback, onRemoveFeedback }) {
   const importRef = useRef(null);
   const excelImportRef = useRef(null);
   return (
     <div>
       <div className="display" style={{ fontSize: 26, color: '#facc15', marginBottom: 12 }}>SETTINGS</div>
+      <FeedbackSection feedback={feedback} onAdd={onAddFeedback} onRemove={onRemoveFeedback} />
       <SyncSettings status={syncStatus} lastSyncAt={lastSyncAt} onSave={onSaveSync} onSyncNow={onSyncNow} />
       <SettingRow label="UNIT">
         <div style={{ display: 'flex', background: '#0a0a0a', borderRadius: 7, padding: 2, border: '1px solid #2a2a2a' }}>
@@ -1626,7 +1884,43 @@ function SettingsView({ settings, setSettings, onExportExcel, onExportJSON, onIm
         </div>
       </div>
 
-      <div style={{ marginTop: 14, fontSize: 9.5, color: '#444', textAlign: 'center' }}>v5.1 · Upper-Focus · Push / Pull / Lower / Upper</div>
+      <div style={{ marginTop: 14, fontSize: 9.5, color: '#444', textAlign: 'center' }}>v5.2 · Upper-Focus · Push / Pull / Lower / Upper</div>
+    </div>
+  );
+}
+
+function FeedbackSection({ feedback, onAdd, onRemove }) {
+  const [text, setText] = useState('');
+  const [open, setOpen] = useState(false);
+  const items = feedback || [];
+  const submit = () => { if (!text.trim()) return; onAdd(text); setText(''); };
+  return (
+    <div style={{ marginBottom: 10, background: '#111', border: '1px solid #2a2a2a', borderRadius: 10, padding: 12 }}>
+      <div style={{ fontSize: 10.5, color: '#facc15', fontWeight: 700, letterSpacing: '0.05em', marginBottom: 3, display: 'flex', alignItems: 'center', gap: 6 }}>💬 REPORT A BUG / IDEA</div>
+      <div style={{ fontSize: 10, color: '#888', marginBottom: 8, lineHeight: 1.4 }}>Write anything you want changed — even mid-workout. It syncs straight to your trainer's inbox.</div>
+      <textarea value={text} onChange={e => setText(e.target.value)} rows={2} placeholder="e.g. The rest timer should auto-start after I log a set…" style={{ width: '100%', background: '#0a0a0a', border: '1px solid #2a2a2a', color: '#f5f5f5', padding: 8, borderRadius: 6, fontSize: 11, lineHeight: 1.5, resize: 'vertical', fontFamily: 'inherit', marginBottom: 6 }} />
+      <button onClick={submit} disabled={!text.trim()} style={{ width: '100%', background: text.trim() ? '#facc15' : '#1a1a1a', color: text.trim() ? '#0a0a0a' : '#444', padding: 9, borderRadius: 7, fontWeight: 700, fontSize: 11 }}>SEND TO INBOX</button>
+      {items.length > 0 && (
+        <>
+          <button onClick={() => setOpen(!open)} style={{ width: '100%', marginTop: 8, background: 'none', color: '#888', fontSize: 10, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 5 }}>
+            {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />} {items.length} SENT
+          </button>
+          {open && (
+            <div style={{ marginTop: 6 }}>
+              {items.map(it => (
+                <div key={it.id} style={{ display: 'flex', gap: 7, alignItems: 'flex-start', padding: '6px 0', borderTop: '1px solid #1a1a1a' }}>
+                  <span style={{ fontSize: 9, color: it.status === 'done' ? '#22c55e' : '#facc15', marginTop: 1 }}>{it.status === 'done' ? '✓' : '•'}</span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 11, color: '#ccc', lineHeight: 1.4, whiteSpace: 'pre-wrap' }}>{it.text}</div>
+                    <div className="mono" style={{ fontSize: 8.5, color: '#555', marginTop: 2 }}>{new Date(it.createdAt).toLocaleDateString()}</div>
+                  </div>
+                  <button onClick={() => onRemove(it.id)} title="Delete" style={{ background: 'none', color: '#555', padding: 2 }}><X size={11} /></button>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }
