@@ -2210,7 +2210,7 @@ function SettingsView({ settings, setSettings, onExportExcel, onExportJSON, onIm
         </div>
       </div>
 
-      <div style={{ marginTop: 14, fontSize: 9.5, color: '#444', textAlign: 'center' }}>v5.2 · Upper-Focus · Push / Pull / Lower / Upper</div>
+      <div style={{ marginTop: 14, fontSize: 9.5, color: '#444', textAlign: 'center' }}>v5.3 · Upper-Focus · Push / Pull / Lower / Upper</div>
     </div>
   );
 }
