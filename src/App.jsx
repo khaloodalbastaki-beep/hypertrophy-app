@@ -536,6 +536,7 @@ export default function HypertrophyApp() {
   const [nowTick, setNowTick] = useState(0);
   const [toast, setToast] = useState(null);
   const [zoomPhoto, setZoomPhoto] = useState(null);
+  const [historyDetail, setHistoryDetail] = useState(null); // sessionKey of the open History detail sheet
 
   // GitHub two-way sync
   const [syncStatus, setSyncStatus] = useState(sync.isConfigured() ? 'idle' : 'off'); // off|idle|syncing|synced|offline|error
@@ -1065,7 +1066,7 @@ export default function HypertrophyApp() {
             sessionStart={sessionStart} sessionEnd={sessionEnd} sessionElapsed={sessionElapsed}
             onStartSession={startSession} onEndSession={requestEndSession} onResetSession={resetSession} />
         )}
-        {view === 'history' && <HistoryView history={history} photos={photos} onZoom={setZoomPhoto} />}
+        {view === 'history' && <HistoryView history={history} photos={photos} settings={settings} onZoom={setZoomPhoto} onOpen={setHistoryDetail} />}
         {view === 'progress' && <ProgressView history={history} bodyweightLog={bodyweightLog} setBodyweightLog={setBodyweightLog} settings={settings} />}
         {view === 'settings' && <SettingsView settings={settings} setSettings={setSettings} onExportExcel={exportToExcel} onExportJSON={exportJSON} onImportJSON={importJSON} onImportExcel={importExcel} onBackupNow={manualBackupNow} onRestore={restoreFromClipboard} lastBackup={lastBackup} syncStatus={syncStatus} lastSyncAt={lastSyncAt} onSaveSync={saveSyncConfig} onSyncNow={syncNow} feedback={feedback} onAddFeedback={addFeedback} onRemoveFeedback={removeFeedback} />}
       </div>
@@ -1074,6 +1075,12 @@ export default function HypertrophyApp() {
       {summaryModal && (
         <SessionSummary mode={summaryModal} rec={currentRec} day={currentDayData} settings={settings}
           onConfirm={confirmEndSession} onClose={() => setSummaryModal(null)} />
+      )}
+
+      {/* HISTORY WORKOUT DETAIL SHEET */}
+      {historyDetail && history[historyDetail] && (
+        <WorkoutDetail sessionKey={historyDetail} history={history} settings={settings} notes={notes} photos={photos}
+          onZoom={setZoomPhoto} onClose={() => setHistoryDetail(null)} />
       )}
 
       {/* BOTTOM NAV */}
@@ -1640,60 +1647,379 @@ function RIRSelect({ value, onChange, ghost }) {
 // HISTORY VIEW
 // ============================================================
 
-function HistoryView({ history, photos, onZoom }) {
-  const sortedDates = Object.keys(history).sort().reverse();
-  const totalSessions = sortedDates.length;
-  const totalSets = sortedDates.reduce((sum, d) => sum + Object.values(history[d].sets || {}).reduce((s, sets) => s + sets.length, 0), 0);
-  if (sortedDates.length === 0) return (
+// ---- History analytics helpers ----
+const DAY_THEME = {
+  push:  { color: '#f97316', emoji: '🔶', muscles: 'Chest · Shoulders · Triceps' },
+  pull:  { color: '#3b82f6', emoji: '🔷', muscles: 'Back · Rear delts · Biceps' },
+  lower: { color: '#22c55e', emoji: '🦵', muscles: 'Quads · Hams · Calves' },
+  upper: { color: '#a855f7', emoji: '💪', muscles: 'Chest · Back · Delts · Arms' },
+};
+// Legacy v4 day labels (dayA–E) mapped to the closest split colour so old
+// workouts still read as coloured muscle days in the calendar/cards.
+const LEGACY_ALIAS = { dayA: 'push', dayB: 'pull', dayC: 'push', dayD: 'upper', dayE: 'lower' };
+const themeFor = (dayKey) => DAY_THEME[dayKey] || DAY_THEME[LEGACY_ALIAS[dayKey]] || { color: '#9ca3af', emoji: '🏋️', muscles: '' };
+const ALL_EX = Object.values(PROGRAM).flatMap(d => d.exercises || []);
+const exNameOf = (exId) => ALL_EX.find(e => e.id === exId)?.name || (exId || '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+
+const e1RM = (w, reps) => (Number(w) || 0) * (1 + Math.min(Number(reps) || 0, 20) / 30);
+const setVol = (s) => (Number(s.weight) || 0) * (s.weightMode === 'perSide' ? 2 : 1) * (Number(s.reps) || 0);
+const recSetCount = (rec) => Object.values(rec?.sets || {}).reduce((t, a) => t + (a ? a.length : 0), 0);
+const recVolume = (rec) => Object.values(rec?.sets || {}).reduce((t, a) => t + (a || []).reduce((x, s) => x + setVol(s), 0), 0);
+const recExDone = (rec) => Object.values(rec?.sets || {}).filter(a => a && a.length).length;
+const recStartOf = (rec, key) => rec?.startTime || rec?.date || (key ? key.split('__')[0] : '');
+const recDurationMin = (rec) => {
+  // Measure to the LAST LOGGED SET (endTime), not finishedAt — a session left open
+  // and finished hours later would otherwise show an absurd training time.
+  const st = rec?.startTime ? new Date(rec.startTime) : null;
+  const en = rec?.endTime ? new Date(rec.endTime) : (rec?.finishedAt ? new Date(rec.finishedAt) : null);
+  if (!st || !en) return null;
+  const m = Math.round((en - st) / 60000);
+  return m >= 0 ? m : null;
+};
+
+const historySessions = (history) => Object.entries(history)
+  .map(([key, rec]) => ({ key, rec, date: rec.date || key.split('__')[0], day: rec.day || key.split('__')[1] || '', start: recStartOf(rec, key) }))
+  .filter(s => recSetCount(s.rec) > 0)
+  .sort((a, b) => String(b.start).localeCompare(String(a.start)));
+
+const prevSameDay = (history, key) => {
+  const cur = history[key]; if (!cur) return null;
+  const curStart = recStartOf(cur, key); const day = cur.day || key.split('__')[1];
+  let best = null, bestStart = '';
+  for (const [k, rec] of Object.entries(history)) {
+    if (k === key) continue;
+    if ((rec.day || k.split('__')[1]) !== day) continue;
+    const st = recStartOf(rec, k);
+    if (st < curStart && recSetCount(rec) > 0 && st > bestStart) { best = { key: k, rec, start: st, date: rec.date || k.split('__')[0] }; bestStart = st; }
+  }
+  return best;
+};
+
+const priorBest = (history, exId, curStart, exceptKey) => {
+  let w = 0, orm = 0;
+  for (const [k, rec] of Object.entries(history)) {
+    if (k === exceptKey || recStartOf(rec, k) >= curStart) continue;
+    const arr = rec.sets?.[exId]; if (!arr) continue;
+    arr.forEach(s => { w = Math.max(w, Number(s.weight) || 0); orm = Math.max(orm, e1RM(s.weight, s.reps)); });
+  }
+  return { w, orm };
+};
+
+// PRs in a session: new max weight or new max est-1RM vs all earlier sessions
+// (only when a prior baseline exists — first-ever logs are not PRs).
+const sessionPRs = (history, key) => {
+  const cur = history[key]; if (!cur) return [];
+  const curStart = recStartOf(cur, key); const out = [];
+  for (const [exId, sets] of Object.entries(cur.sets || {})) {
+    if (!sets?.length) continue;
+    const prior = priorBest(history, exId, curStart, key);
+    if (prior.w === 0 && prior.orm === 0) continue;
+    const curW = Math.max(...sets.map(s => Number(s.weight) || 0));
+    const cur1 = Math.max(...sets.map(s => e1RM(s.weight, s.reps)));
+    if (curW > prior.w) out.push({ exId, kind: 'weight', value: curW, unit: sets[0].unit });
+    else if (cur1 > prior.orm * 1.005) out.push({ exId, kind: 'e1rm', value: Math.round(cur1) });
+  }
+  return out;
+};
+
+const _ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const _mondayOf = (dateStr) => { const d = new Date(dateStr + 'T00:00:00'); d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); return d; };
+const weekStreak = (history) => {
+  const set = new Set(historySessions(history).map(s => _ymd(_mondayOf(s.date))));
+  if (!set.size) return 0;
+  const latest = [...set].sort().reverse()[0];
+  let cur = new Date(latest + 'T00:00:00'), streak = 0;
+  while (set.has(_ymd(cur))) { streak++; cur.setDate(cur.getDate() - 7); }
+  return streak;
+};
+const calendarCells = (history, weeks = 5) => {
+  const byDate = {}; historySessions(history).forEach(s => { byDate[s.date] = s.day; });
+  const today = new Date(); const start = _mondayOf(_ymd(today)); start.setDate(start.getDate() - 7 * (weeks - 1));
+  const cells = [];
+  for (let i = 0; i < weeks * 7; i++) { const d = new Date(start); d.setDate(d.getDate() + i); const key = _ymd(d); cells.push({ date: key, day: byDate[key], isToday: key === _ymd(today), future: d > today }); }
+  return cells;
+};
+
+const relDate = (dateStr) => {
+  const d = new Date(dateStr + 'T00:00:00'); const now = new Date(); now.setHours(0, 0, 0, 0);
+  const diff = Math.round((now - d) / 86400000);
+  const md = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  if (diff === 0) return `Today · ${md}`;
+  if (diff === 1) return `Yesterday · ${md}`;
+  if (diff > 1 && diff < 7) return `${d.toLocaleDateString('en-US', { weekday: 'short' })} · ${md}`;
+  return md + (d.getFullYear() !== now.getFullYear() ? ` ${d.getFullYear()}` : '');
+};
+const fmtClock = (iso) => { try { const d = new Date(iso); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; } catch (e) { return '—'; } };
+
+// ============================================================
+// HISTORY VIEW — training diary
+// ============================================================
+function HistoryView({ history, photos, settings, onZoom, onOpen }) {
+  const sessions = historySessions(history);
+  if (sessions.length === 0) return (
     <div style={{ textAlign: 'center', padding: 36, color: '#666' }}>
       <Calendar size={32} style={{ marginBottom: 10, opacity: 0.5 }} />
       <div style={{ fontSize: 13 }}>No workouts logged yet</div>
-      <div style={{ fontSize: 11, marginTop: 6 }}>Logged sets will appear here. If you have data from a previous backup, paste it via the RESTORE button at the top.</div>
+      <div style={{ fontSize: 11, marginTop: 6 }}>Finished workouts will appear here as a training diary you can tap into.</div>
     </div>
   );
+  const totalSets = sessions.reduce((s, x) => s + recSetCount(x.rec), 0);
+  const streak = weekStreak(history);
+  const thisWeekMon = _ymd(_mondayOf(_ymd(new Date())));
+  const thisWeek = sessions.filter(s => _ymd(_mondayOf(s.date)) === thisWeekMon).length;
+  const totalPRs = sessions.reduce((s, x) => s + sessionPRs(history, x.key).length, 0);
+  const cells = calendarCells(history, 5);
+  const dow = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
+
   return (
     <div>
-      <div className="display" style={{ fontSize: 26, color: '#facc15', marginBottom: 4 }}>HISTORY</div>
-      <div style={{ fontSize: 11, color: '#888', marginBottom: 12 }}>{totalSessions} sessions · {totalSets} sets logged</div>
-      {sortedDates.map(key => {
-        const day = history[key];
-        const date = day.date || key.split('__')[0];
-        const dayMeta = PROGRAM[day.day];
-        const dayLabel = dayMeta ? `${dayMeta.label}: ${dayMeta.name}` : (day.day || '').toString().toUpperCase();
-        const totalSets = Object.values(day.sets || {}).reduce((sum, sets) => sum + sets.length, 0);
-        const duration = day.endTime && day.startTime ? Math.round((new Date(day.endTime) - new Date(day.startTime)) / 60000) : null;
-        return (
-          <div key={key} style={{ background: '#111', border: '1px solid #1f1f1f', borderRadius: 10, padding: 11, marginBottom: 9 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 7 }}>
-              <div>
-                <div className="mono" style={{ fontSize: 9.5, color: '#666' }}>{date}</div>
-                <div className="display" style={{ fontSize: 17, color: '#facc15', lineHeight: 1.1 }}>{dayLabel}</div>
-              </div>
-              <div style={{ textAlign: 'right' }}>
-                <div className="mono" style={{ fontSize: 11, color: '#ddd' }}>{totalSets} SETS</div>
-                {duration && <div className="mono" style={{ fontSize: 9.5, color: '#666' }}>{duration} MIN</div>}
-              </div>
-            </div>
-            <div>
-              {Object.entries(day.sets || {}).map(([exId, sets]) => {
-                const ex = Object.values(PROGRAM).flatMap(d => d.exercises || []).find(e => e.id === exId);
-                const photo = photos[exId];
-                return (
-                  <div key={exId} style={{ marginBottom: 5, fontSize: 10.5, display: 'flex', gap: 8, alignItems: 'flex-start' }}>
-                    {photo && <div onClick={() => onZoom?.(photo)} style={{ width: 24, height: 24, borderRadius: 4, background: `url(${photo}) center/cover`, flexShrink: 0, cursor: 'zoom-in' }} />}
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ color: '#aaa', fontWeight: 700 }}>{ex?.name || exId}</div>
-                      <div className="mono" style={{ color: '#666', fontSize: 9.5, marginLeft: 2 }}>
-                        {sets.map(s => `${s.weight}${s.weightMode === 'perSide' ? '×2' : ''}${s.unit}×${s.reps}`).join('  ·  ')}
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
+      <div className="display" style={{ fontSize: 26, color: '#facc15', marginBottom: 10 }}>TRAINING DIARY</div>
+
+      {/* SUMMARY CHIPS */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 7, marginBottom: 12 }}>
+        {[
+          { v: sessions.length, u: 'WORKOUTS', c: '#f5f5f5' },
+          { v: thisWeek, u: 'THIS WEEK', c: '#f5f5f5' },
+          { v: streak, u: 'WEEK STREAK', c: '#f97316', icon: <Flame size={11} color="#f97316" /> },
+          { v: totalPRs, u: 'PRs', c: '#facc15', icon: <span style={{ fontSize: 11 }}>🏆</span> },
+        ].map((b, i) => (
+          <div key={i} style={{ background: '#111', border: '1px solid #1f1f1f', borderRadius: 9, padding: '9px 4px', textAlign: 'center' }}>
+            <div className="mono" style={{ fontSize: 18, fontWeight: 700, color: b.c, lineHeight: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 3 }}>{b.icon}{b.v}</div>
+            <div style={{ fontSize: 7.5, color: '#777', fontWeight: 700, letterSpacing: '0.05em', marginTop: 4 }}>{b.u}</div>
           </div>
-        );
-      })}
+        ))}
+      </div>
+
+      {/* CALENDAR STRIP */}
+      <div style={{ background: '#111', border: '1px solid #1f1f1f', borderRadius: 10, padding: '9px 11px 11px', marginBottom: 14 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+          <span style={{ fontSize: 9, color: '#777', fontWeight: 700, letterSpacing: '0.06em' }}>LAST 5 WEEKS</span>
+          <div style={{ display: 'flex', gap: 8 }}>
+            {Object.entries(DAY_THEME).map(([k, t]) => (
+              <span key={k} style={{ display: 'flex', alignItems: 'center', gap: 3, fontSize: 7.5, color: '#888', fontWeight: 700 }}>
+                <span style={{ width: 7, height: 7, borderRadius: 2, background: t.color }} />{k.toUpperCase()}
+              </span>
+            ))}
+          </div>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7,1fr)', gap: 4 }}>
+          {dow.map((d, i) => <div key={'h' + i} style={{ textAlign: 'center', fontSize: 7.5, color: '#555', fontWeight: 700 }}>{d}</div>)}
+          {cells.map((c, i) => {
+            const t = c.day ? themeFor(c.day) : null;
+            return <div key={i} title={c.date} style={{ aspectRatio: '1', borderRadius: 3, background: t ? t.color : (c.future ? 'transparent' : '#191919'), opacity: c.future ? 0.25 : 1, border: c.isToday ? '1.5px solid #facc15' : '1px solid #161616' }} />;
+          })}
+        </div>
+      </div>
+
+      {/* WORKOUT CARDS */}
+      <div style={{ fontSize: 9, color: '#777', fontWeight: 700, letterSpacing: '0.06em', marginBottom: 8 }}>RECENT WORKOUTS</div>
+      {sessions.map(s => <HistoryDayCard key={s.key} session={s} history={history} settings={settings} onOpen={onOpen} />)}
+    </div>
+  );
+}
+
+function DeltaPill({ value, unit = '', label = '', betterUp = true, neutral = false, small }) {
+  if (value === 0 || value == null || isNaN(value)) {
+    return <span style={{ fontSize: small ? 8.5 : 9.5, color: '#666', fontWeight: 700 }}>{label}{label ? ' ' : ''}=</span>;
+  }
+  const up = value > 0;
+  const col = neutral ? '#9ca3af' : ((betterUp ? up : !up) ? '#22c55e' : '#ef4444');
+  return <span style={{ fontSize: small ? 8.5 : 9.5, color: col, fontWeight: 700, whiteSpace: 'nowrap' }}>{label}{label ? ' ' : ''}{up ? '↑' : '↓'}{Math.abs(Math.round(value * 10) / 10)}{unit}</span>;
+}
+
+function HistoryDayCard({ session, history, settings, onOpen }) {
+  const { key, rec, date, day } = session;
+  const t = themeFor(day);
+  const meta = PROGRAM[day];
+  const title = meta ? meta.name : (day || '').toString().toUpperCase();
+  const sets = recSetCount(rec); const vol = Math.round(recVolume(rec)); const dur = recDurationMin(rec);
+  const prs = sessionPRs(history, key);
+  const prev = prevSameDay(history, key);
+  const volDelta = prev ? vol - Math.round(recVolume(prev.rec)) : null;
+
+  return (
+    <button onClick={() => onOpen(key)} style={{ width: '100%', textAlign: 'left', background: '#111', border: '1px solid #1f1f1f', borderRadius: 11, padding: 0, marginBottom: 9, overflow: 'hidden', display: 'flex' }}>
+      <div style={{ width: 4, background: t.color, flexShrink: 0 }} />
+      <div style={{ flex: 1, minWidth: 0, padding: '10px 11px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
+          <div style={{ minWidth: 0 }}>
+            <div className="mono" style={{ fontSize: 9.5, color: '#777' }}>{relDate(date)}</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 1 }}>
+              <span style={{ fontSize: 13 }}>{t.emoji}</span>
+              <span className="display" style={{ fontSize: 18, color: t.color, lineHeight: 1 }}>{title}</span>
+              {prs.length > 0 && <span style={{ fontSize: 9, background: '#facc15', color: '#0a0a0a', fontWeight: 700, borderRadius: 4, padding: '1px 5px' }}>🏆 {prs.length}</span>}
+            </div>
+            {meta && <div style={{ fontSize: 9.5, color: '#777', marginTop: 3 }}>{t.muscles}</div>}
+          </div>
+          <ChevronRight size={16} color="#555" style={{ flexShrink: 0, marginTop: 2 }} />
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 8, flexWrap: 'wrap' }}>
+          <span className="mono" style={{ fontSize: 10.5, color: '#ddd' }}>{recExDone(rec)} ex · {sets} sets</span>
+          <span className="mono" style={{ fontSize: 10.5, color: '#ddd' }}>{vol.toLocaleString()} {settings.unit}</span>
+          {dur != null && <span className="mono" style={{ fontSize: 10.5, color: '#888' }}><Clock size={9} style={{ verticalAlign: '-1px' }} /> {dur}m</span>}
+          {prev ? <DeltaPill value={volDelta} unit={` ${settings.unit}`} label="vol" /> : <span style={{ fontSize: 9, color: '#666', fontWeight: 700 }}>first time</span>}
+        </div>
+      </div>
+    </button>
+  );
+}
+
+// ============================================================
+// WORKOUT DETAIL — bottom sheet
+// ============================================================
+function WorkoutDetail({ sessionKey, history, settings, notes, photos, onZoom, onClose }) {
+  const rec = history[sessionKey];
+  const day = rec.day || sessionKey.split('__')[1];
+  const t = themeFor(day);
+  const meta = PROGRAM[day];
+  const date = rec.date || sessionKey.split('__')[0];
+  const prs = sessionPRs(history, sessionKey);
+  const prSet = new Set(prs.map(p => p.exId));
+  const prev = prevSameDay(history, sessionKey);
+  const dur = recDurationMin(rec);
+  const sets = recSetCount(rec); const vol = Math.round(recVolume(rec));
+  const plan = meta?.exercises || [];
+  const planIds = plan.map(e => e.id);
+  const loggedIds = Object.keys(rec.sets || {}).filter(id => rec.sets[id]?.length);
+  const skipped = plan.filter(e => !rec.sets[e.id]?.length);
+  const extra = loggedIds.filter(id => !planIds.includes(id));
+  // order exercises by the plan, then extras
+  const orderedIds = [...planIds.filter(id => rec.sets[id]?.length), ...extra];
+
+  // vs-previous aggregates
+  let improvedCount = 0, comparedCount = 0;
+  if (prev) {
+    orderedIds.forEach(id => {
+      const p = prev.rec.sets?.[id]; if (!p?.length) return;
+      comparedCount++;
+      const cur1 = Math.max(...rec.sets[id].map(s => e1RM(s.weight, s.reps)));
+      const prv1 = Math.max(...p.map(s => e1RM(s.weight, s.reps)));
+      if (cur1 > prv1 * 1.001) improvedCount++;
+    });
+  }
+  const stat = [
+    { v: dur != null ? `${dur}` : '—', u: 'MIN' },
+    { v: `${recExDone(rec)}${plan.length ? '/' + plan.length : ''}`, u: 'EXERCISES' },
+    { v: `${sets}`, u: 'SETS' },
+    { v: vol.toLocaleString(), u: settings.unit.toUpperCase() },
+  ];
+
+  return (
+    <div onClick={onClose} style={{ position: 'fixed', inset: 0, zIndex: 320, background: 'rgba(0,0,0,0.75)', display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }}>
+      <div onClick={e => e.stopPropagation()} style={{ width: '100%', maxWidth: 460, maxHeight: '92vh', background: '#0f0f0f', borderTop: `2px solid ${t.color}`, borderTopLeftRadius: 18, borderTopRightRadius: 18, display: 'flex', flexDirection: 'column', boxShadow: '0 -10px 40px rgba(0,0,0,0.6)' }}>
+        {/* header */}
+        <div style={{ padding: '14px 16px 10px', borderBottom: '1px solid #1a1a1a' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+            <div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                <span style={{ fontSize: 17 }}>{t.emoji}</span>
+                <span className="display" style={{ fontSize: 23, color: t.color, lineHeight: 1 }}>{meta ? meta.name : (day || '').toUpperCase()}</span>
+              </div>
+              <div style={{ fontSize: 11, color: '#888', marginTop: 4 }}>{new Date(date + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' })}</div>
+            </div>
+            <button onClick={onClose} style={{ background: 'rgba(255,255,255,0.08)', color: '#aaa', width: 30, height: 30, borderRadius: 15, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}><X size={16} /></button>
+          </div>
+          {prs.length > 0 && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 9 }}>
+              {prs.map((p, i) => (
+                <span key={i} style={{ fontSize: 9.5, background: '#facc15', color: '#0a0a0a', fontWeight: 700, borderRadius: 5, padding: '2px 7px' }}>🏆 {exNameOf(p.exId)} {p.kind === 'weight' ? `${p.value}${p.unit} PR` : 'est-1RM PR'}</span>
+              ))}
+            </div>
+          )}
+          <div style={{ fontSize: 10, color: '#777', marginTop: 9 }}>
+            {rec.startTime ? `${fmtClock(rec.startTime)} → ${rec.endTime || rec.finishedAt ? fmtClock(rec.endTime || rec.finishedAt) : '—'}` : 'time not recorded'}{dur != null ? ` · ${dur} min` : ''}
+          </div>
+        </div>
+
+        {/* scroll body */}
+        <div style={{ overflowY: 'auto', padding: '12px 16px 22px' }}>
+          {/* stat grid */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 7, marginBottom: 12 }}>
+            {stat.map((b, i) => (
+              <div key={i} style={{ background: '#161616', border: '1px solid #242424', borderRadius: 9, padding: '8px 3px', textAlign: 'center' }}>
+                <div className="mono" style={{ fontSize: 15, fontWeight: 700, color: '#f5f5f5', lineHeight: 1 }}>{b.v}</div>
+                <div style={{ fontSize: 7, color: '#777', fontWeight: 700, letterSpacing: '0.05em', marginTop: 3 }}>{b.u}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* vs previous */}
+          <div style={{ background: '#11140f', border: `1px solid ${prev ? '#243018' : '#242424'}`, borderRadius: 10, padding: '9px 11px', marginBottom: 14 }}>
+            {prev ? (
+              <>
+                <div style={{ fontSize: 9, color: '#8aa86a', fontWeight: 700, letterSpacing: '0.05em', marginBottom: 6 }}>VS LAST {(meta ? meta.label : day).toString().toUpperCase()} · {relDate(prev.date)}</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12 }}>
+                  <DeltaPill value={vol - Math.round(recVolume(prev.rec))} unit={` ${settings.unit}`} label="volume" />
+                  <DeltaPill value={sets - recSetCount(prev.rec)} label="sets" />
+                  {dur != null && recDurationMin(prev.rec) != null && <DeltaPill value={dur - recDurationMin(prev.rec)} unit="m" label="time" neutral />}
+                  {comparedCount > 0 && <span style={{ fontSize: 9.5, color: improvedCount > 0 ? '#22c55e' : '#888', fontWeight: 700 }}>💪 stronger on {improvedCount}/{comparedCount} lifts</span>}
+                </div>
+              </>
+            ) : <div style={{ fontSize: 10, color: '#888' }}>First time doing this workout — this is your baseline.</div>}
+          </div>
+
+          {/* exercises */}
+          <div style={{ fontSize: 9, color: '#777', fontWeight: 700, letterSpacing: '0.06em', marginBottom: 8 }}>EXERCISES</div>
+          {orderedIds.map(id => (
+            <ExerciseHistoryRow key={id} exId={id} sets={rec.sets[id]} settings={settings} note={notes?.[id]} photo={photos?.[id]} onZoom={onZoom}
+              isPR={prSet.has(id)} pr={prs.find(p => p.exId === id)} prevSets={prev?.rec.sets?.[id]} offPlan={!planIds.includes(id)} />
+          ))}
+
+          {/* skipped */}
+          {skipped.length > 0 && (
+            <div style={{ marginTop: 6 }}>
+              <div style={{ fontSize: 9, color: '#777', fontWeight: 700, letterSpacing: '0.06em', marginBottom: 6 }}>NOT DONE ({skipped.length})</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+                {skipped.map(e => <span key={e.id} style={{ fontSize: 10, color: '#888', background: '#141414', border: '1px solid #242424', borderRadius: 5, padding: '3px 8px' }}>{e.name}</span>)}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div style={{ padding: '10px 16px 18px', borderTop: '1px solid #1a1a1a' }}>
+          <button onClick={onClose} style={{ width: '100%', background: '#1a1a1a', color: '#ddd', border: '1px solid #2a2a2a', padding: 12, borderRadius: 10, fontWeight: 700, fontSize: 12 }}>CLOSE</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ExerciseHistoryRow({ exId, sets, settings, note, photo, onZoom, isPR, pr, prevSets, offPlan }) {
+  if (!sets?.length) return null;
+  const topW = Math.max(...sets.map(s => Number(s.weight) || 0));
+  const best1 = Math.round(Math.max(...sets.map(s => e1RM(s.weight, s.reps))));
+  const vol = Math.round(sets.reduce((a, s) => a + setVol(s), 0));
+  const unit = sets[0].unit || settings.unit;
+  const perSide = sets[0].weightMode === 'perSide';
+  // per-exercise vs previous
+  let wDelta = null, vDelta = null;
+  if (prevSets?.length) {
+    wDelta = topW - Math.max(...prevSets.map(s => Number(s.weight) || 0));
+    vDelta = vol - Math.round(prevSets.reduce((a, s) => a + setVol(s), 0));
+  }
+  return (
+    <div style={{ background: '#111', border: `1px solid ${isPR ? '#3d3410' : '#1c1c1c'}`, borderRadius: 9, padding: '9px 10px', marginBottom: 7 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        {photo && <div onClick={() => onZoom?.(photo)} style={{ width: 26, height: 26, borderRadius: 5, background: `url(${photo}) center/cover`, flexShrink: 0, cursor: 'zoom-in' }} />}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 12, fontWeight: 700, color: '#f5f5f5' }}>{exNameOf(exId)}</span>
+            {isPR && <span style={{ fontSize: 8.5, background: '#facc15', color: '#0a0a0a', fontWeight: 700, borderRadius: 4, padding: '1px 5px' }}>🏆 {pr?.kind === 'weight' ? 'WEIGHT PR' : 'est-1RM PR'}</span>}
+            {offPlan && <span style={{ fontSize: 8, color: '#fdba74', border: '1px solid #7c3a12', borderRadius: 4, padding: '1px 5px', fontWeight: 700 }}>OFF-PLAN</span>}
+          </div>
+          <div className="mono" style={{ fontSize: 9.5, color: '#888', marginTop: 3, lineHeight: 1.5 }}>
+            {sets.map((s) => `${s.weight}${s.unit}${s.weightMode === 'perSide' ? '/s' : ''}×${s.reps} @${s.rir}`).join('   ·   ')}
+          </div>
+        </div>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 6, flexWrap: 'wrap', fontSize: 9.5 }}>
+        <span className="mono" style={{ color: '#aaa' }}>top {topW}{unit}{perSide ? '/s' : ''}</span>
+        <span className="mono" style={{ color: '#777' }}>est 1RM {best1}{unit}</span>
+        <span className="mono" style={{ color: '#777' }}>vol {vol.toLocaleString()}{unit}</span>
+        {prevSets?.length ? <DeltaPill value={wDelta} unit={unit} label="wt" small /> : <span style={{ fontSize: 8.5, color: '#666', fontWeight: 700 }}>new</span>}
+        {prevSets?.length ? <DeltaPill value={vDelta} unit={unit} label="vol" small /> : null}
+      </div>
+      {note && <div style={{ fontSize: 9.5, color: '#7e9a64', marginTop: 6, display: 'flex', gap: 5, alignItems: 'flex-start' }}><span>📝</span><span style={{ whiteSpace: 'pre-wrap' }}>{note}</span></div>}
     </div>
   );
 }
