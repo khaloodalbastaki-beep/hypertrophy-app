@@ -519,6 +519,7 @@ export default function HypertrophyApp() {
   const [videos, setVideos] = useState({});
   const [notes, setNotes] = useState({});          // per-exercise setup notes (pin #, seat height…)
   const [feedback, setFeedback] = useState([]);     // in-app bug/idea reports
+  const [exerciseUnits, setExerciseUnits] = useState({}); // per-exercise weight unit choice (exId -> 'kg'|'lb')
   const [bodyweightLog, setBodyweightLog] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [lastBackup, setLastBackup] = useState(null);
@@ -571,6 +572,7 @@ export default function HypertrophyApp() {
       const v = await loadKey('hyp_videos'); if (v) setVideos(v);
       const nt = await loadKey('hyp_notes'); if (nt) setNotes(nt);
       const fb = await loadKey('hyp_feedback'); if (fb) setFeedback(fb);
+      const eu = await loadKey('hyp_exercise_units'); if (eu) setExerciseUnits(eu);
       const bw = await loadKey('hyp_bodyweight'); if (bw) setBodyweightLog(bw);
       const rest = await loadKey('hyp_rest'); if (rest && rest.restEndAt && rest.restEndAt > Date.now()) { setRestEndAt(rest.restEndAt); setRestTotalSec(rest.restTotalSec); }
       const lb = await loadKey('hyp_last_backup'); if (lb) setLastBackup(lb);
@@ -589,6 +591,7 @@ export default function HypertrophyApp() {
   useEffect(() => { if (loaded) window.storage.set('hyp_photos', JSON.stringify(photos)).catch(() => {}); }, [photos, loaded]);
   useEffect(() => { if (loaded) window.storage.set('hyp_videos', JSON.stringify(videos)).catch(() => {}); }, [videos, loaded]);
   useEffect(() => { if (loaded) window.storage.set('hyp_notes', JSON.stringify(notes)).catch(() => {}); }, [notes, loaded]);
+  useEffect(() => { if (loaded) window.storage.set('hyp_exercise_units', JSON.stringify(exerciseUnits)).catch(() => {}); }, [exerciseUnits, loaded]);
   useEffect(() => { if (loaded) window.storage.set('hyp_feedback', JSON.stringify(feedback)).catch(() => {}); }, [feedback, loaded]);
   useEffect(() => { if (loaded) window.storage.set('hyp_bodyweight', JSON.stringify(bodyweightLog)).catch(() => {}); }, [bodyweightLog, loaded]);
   useEffect(() => {
@@ -604,12 +607,12 @@ export default function HypertrophyApp() {
     (async () => {
       setSyncStatus('syncing');
       try {
-        const local = { settings, history, photos, videos, bodyweightLog, feedback, notes, updatedAt: localStorage.getItem('hyp_updatedAt') || '', hasLocal: Object.keys(history).length > 0 };
+        const local = { settings, history, photos, videos, bodyweightLog, feedback, notes, units: exerciseUnits, updatedAt: localStorage.getItem('hyp_updatedAt') || '', hasLocal: Object.keys(history).length > 0 };
         const m = await sync.pullMerge(local);
         shaRef.current = m.shas;
         setSettings(prev => ({ ...prev, ...m.settings }));
-        setHistory(m.history); setBodyweightLog(m.bodyweightLog); setVideos(m.videos); setPhotos(m.photos); setFeedback(m.feedback); setNotes(m.notes);
-        if (m.localAhead) shaRef.current.history = await sync.pushHistory({ settings: m.settings, history: m.history, bodyweightLog: m.bodyweightLog, videos: m.videos, feedback: m.feedback, notes: m.notes }, m.shas.history);
+        setHistory(m.history); setBodyweightLog(m.bodyweightLog); setVideos(m.videos); setPhotos(m.photos); setFeedback(m.feedback); setNotes(m.notes); setExerciseUnits(m.units);
+        if (m.localAhead) shaRef.current.history = await sync.pushHistory({ settings: m.settings, history: m.history, bodyweightLog: m.bodyweightLog, videos: m.videos, feedback: m.feedback, notes: m.notes, units: m.units }, m.shas.history);
         setSyncStatus('synced'); setLastSyncAt(new Date().toISOString());
       } catch (e) { setSyncStatus(navigator.onLine ? 'error' : 'offline'); }
       setTimeout(() => { syncReadyRef.current = true; }, 0);
@@ -623,13 +626,13 @@ export default function HypertrophyApp() {
     pushTimer.current = setTimeout(async () => {
       setSyncStatus('syncing');
       try {
-        shaRef.current.history = await sync.pushHistory({ settings, history, bodyweightLog, videos, feedback, notes }, shaRef.current.history);
+        shaRef.current.history = await sync.pushHistory({ settings, history, bodyweightLog, videos, feedback, notes, units: exerciseUnits }, shaRef.current.history);
         localStorage.setItem('hyp_updatedAt', new Date().toISOString());
         setSyncStatus('synced'); setLastSyncAt(new Date().toISOString());
       } catch (e) { setSyncStatus(navigator.onLine ? 'error' : 'offline'); }
     }, 2500);
     return () => clearTimeout(pushTimer.current);
-  }, [history, settings, bodyweightLog, videos, feedback, notes]);
+  }, [history, settings, bodyweightLog, videos, feedback, notes, exerciseUnits]);
 
   // --- push photos.json on change (debounced; large file, kept separate) ---
   useEffect(() => {
@@ -642,10 +645,10 @@ export default function HypertrophyApp() {
   }, [photos]);
 
   const pullMergePush = async () => {
-    const m = await sync.pullMerge({ settings, history, photos, videos, bodyweightLog, feedback, notes, updatedAt: localStorage.getItem('hyp_updatedAt') || '', hasLocal: Object.keys(history).length > 0 });
+    const m = await sync.pullMerge({ settings, history, photos, videos, bodyweightLog, feedback, notes, units: exerciseUnits, updatedAt: localStorage.getItem('hyp_updatedAt') || '', hasLocal: Object.keys(history).length > 0 });
     shaRef.current = m.shas;
-    setSettings(prev => ({ ...prev, ...m.settings })); setHistory(m.history); setBodyweightLog(m.bodyweightLog); setVideos(m.videos); setPhotos(m.photos); setFeedback(m.feedback); setNotes(m.notes);
-    shaRef.current.history = await sync.pushHistory({ settings: m.settings, history: m.history, bodyweightLog: m.bodyweightLog, videos: m.videos, feedback: m.feedback, notes: m.notes }, m.shas.history);
+    setSettings(prev => ({ ...prev, ...m.settings })); setHistory(m.history); setBodyweightLog(m.bodyweightLog); setVideos(m.videos); setPhotos(m.photos); setFeedback(m.feedback); setNotes(m.notes); setExerciseUnits(m.units);
+    shaRef.current.history = await sync.pushHistory({ settings: m.settings, history: m.history, bodyweightLog: m.bodyweightLog, videos: m.videos, feedback: m.feedback, notes: m.notes, units: m.units }, m.shas.history);
     shaRef.current.photos = await sync.pushPhotos({ photos: m.photos }, m.shas.photos);
     localStorage.setItem('hyp_updatedAt', new Date().toISOString());
   };
@@ -795,6 +798,7 @@ export default function HypertrophyApp() {
   const setPhoto = (exId, url) => setPhotos(p => ({ ...p, [exId]: url }));
   const setVideoUrl = (exId, url) => setVideos(v => ({ ...v, [exId]: url }));
   const setNote = (exId, text) => setNotes(n => { const next = { ...n }; if (text && text.trim()) next[exId] = text; else delete next[exId]; return next; });
+  const setExerciseUnit = (exId, unit) => setExerciseUnits(u => ({ ...u, [exId]: unit }));
   const addFeedback = (text, page) => {
     const entry = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 7), text: text.trim(), createdAt: new Date().toISOString(), status: 'open', page: page || '' };
     setFeedback(f => [entry, ...f]);
@@ -805,7 +809,7 @@ export default function HypertrophyApp() {
   const buildBackupJSON = () => JSON.stringify({
     version: 5,
     exportedAt: new Date().toISOString(),
-    settings, history, photos, videos, bodyweightLog, notes, feedback,
+    settings, history, photos, videos, bodyweightLog, notes, feedback, exerciseUnits,
   });
 
   const autoBackupToClipboard = async () => {
@@ -847,6 +851,7 @@ export default function HypertrophyApp() {
       if (data.videos) setVideos(data.videos);
       if (data.notes) setNotes(data.notes);
       if (data.feedback) setFeedback(data.feedback);
+      if (data.exerciseUnits) setExerciseUnits(data.exerciseUnits);
       if (data.bodyweightLog) setBodyweightLog(data.bodyweightLog);
       alert(`✓ Restored ${Object.keys(data.history).length} sessions from clipboard`);
     } catch (e) {
@@ -900,6 +905,7 @@ export default function HypertrophyApp() {
         if (data.videos) setVideos(data.videos);
         if (data.notes) setNotes(data.notes);
         if (data.feedback) setFeedback(data.feedback);
+        if (data.exerciseUnits) setExerciseUnits(data.exerciseUnits);
         if (data.bodyweightLog) setBodyweightLog(data.bodyweightLog);
         alert(`✓ Restored from ${data.exportedAt || 'backup'}`);
       } catch (err) { alert('Invalid backup file'); }
@@ -1060,8 +1066,8 @@ export default function HypertrophyApp() {
       <div style={{ padding: '12px 14px' }}>
         {view === 'today' && (
           <TodayView day={currentDayData} dayKey={selectedDay} settings={settings} history={history}
-            todayHistory={todayHistory} photos={photos} videos={videos} notes={notes}
-            onLogSet={logSet} onUndo={undoLastSet} onPhoto={setPhoto} onVideo={setVideoUrl} onNote={setNote}
+            todayHistory={todayHistory} photos={photos} videos={videos} notes={notes} exerciseUnits={exerciseUnits}
+            onLogSet={logSet} onUndo={undoLastSet} onPhoto={setPhoto} onVideo={setVideoUrl} onNote={setNote} onUnit={setExerciseUnit}
             onStartRest={startRest} setSettings={setSettings} onZoom={setZoomPhoto}
             sessionStart={sessionStart} sessionEnd={sessionEnd} sessionElapsed={sessionElapsed}
             onStartSession={startSession} onEndSession={requestEndSession} onResetSession={resetSession} />
@@ -1163,7 +1169,7 @@ function DaySelector({ selected, onSelect }) {
 // TODAY VIEW
 // ============================================================
 
-function TodayView({ day, dayKey, settings, history, todayHistory, photos, videos, notes, onLogSet, onUndo, onPhoto, onVideo, onNote, onStartRest, setSettings, onZoom, sessionStart, sessionEnd, sessionElapsed, onStartSession, onEndSession, onResetSession }) {
+function TodayView({ day, dayKey, settings, history, todayHistory, photos, videos, notes, exerciseUnits, onLogSet, onUndo, onPhoto, onVideo, onNote, onUnit, onStartRest, setSettings, onZoom, sessionStart, sessionEnd, sessionElapsed, onStartSession, onEndSession, onResetSession }) {
   const [warmupOpen, setWarmupOpen] = useState(false);
   const [rirInfoOpen, setRirInfoOpen] = useState(false);
 
@@ -1217,9 +1223,9 @@ function TodayView({ day, dayKey, settings, history, todayHistory, photos, video
       <div style={{ marginTop: 12 }}>
         {day.exercises.map((ex, idx) => (
           <ExerciseCard key={ex.id + idx} index={idx + 1} exercise={ex} settings={settings} history={history}
-            todaysets={todayHistory.sets[ex.id] || []} photo={photos[ex.id]} customVideo={videos[ex.id]} note={notes?.[ex.id]}
+            todaysets={todayHistory.sets[ex.id] || []} photo={photos[ex.id]} customVideo={videos[ex.id]} note={notes?.[ex.id]} exerciseUnit={exerciseUnits?.[ex.id]}
             onLogSet={(setData) => onLogSet(ex.id, ex.name, ex.sets, setData)} onUndo={() => onUndo(ex.id)}
-            onPhoto={(url) => onPhoto(ex.id, url)} onVideoUpdate={(url) => onVideo(ex.id, url)} onNote={(t) => onNote(ex.id, t)} onZoom={onZoom}
+            onPhoto={(url) => onPhoto(ex.id, url)} onVideoUpdate={(url) => onVideo(ex.id, url)} onNote={(t) => onNote(ex.id, t)} onUnit={(u) => onUnit(ex.id, u)} onZoom={onZoom}
             onStartRest={() => onStartRest(ex.rest)} />
         ))}
       </div>
@@ -1345,7 +1351,7 @@ function WarmupContent({ mobility }) {
 // EXERCISE CARD
 // ============================================================
 
-function ExerciseCard({ index, exercise, settings, history, todaysets, photo, customVideo, note, onLogSet, onUndo, onPhoto, onVideoUpdate, onNote, onStartRest, onZoom }) {
+function ExerciseCard({ index, exercise, settings, history, todaysets, photo, customVideo, note, exerciseUnit, onLogSet, onUndo, onPhoto, onVideoUpdate, onNote, onUnit, onStartRest, onZoom }) {
   const [expanded, setExpanded] = useState(false);
   const [editingVideo, setEditingVideo] = useState(false);
   const [videoInput, setVideoInput] = useState('');
@@ -1362,17 +1368,20 @@ function ExerciseCard({ index, exercise, settings, history, todaysets, photo, cu
   const lastSession = past[0] ? { date: past[0].date, sets: past[0].sets } : null;
   const suggestion = smartSuggest(exercise, history);
 
-  // Reference values for the GREY placeholders (not real input values):
-  // within a session, mirror the set you just did; otherwise the smart suggestion;
-  // otherwise the program's seeded starting weight.
-  const convW = (w, u) => (u === settings.unit ? w : (u === 'kg' ? kgToLb(w) : lbToKg(w)));
+  // Per-exercise weight unit: an explicit choice for THIS exercise wins, else the
+  // unit it was last logged in, else the app default. Weights are NEVER auto-converted.
   const roundPh = (n) => (typeof n === 'number' ? Math.round(n * 10) / 10 : n);
   const lastThis = todaysets[todaysets.length - 1] || null;
+  const lastAnySet = lastThis || (lastSession ? lastSession.sets[lastSession.sets.length - 1] : null);
+  const displayUnit = exerciseUnit || lastAnySet?.unit || settings.unit;
+  // Grey placeholder reference shown ONLY when it's already in the display unit, so
+  // 50 kg stays "50", 120 lb stays "120" — never converted across units.
+  const refSameUnit = (w, u) => (u === displayUnit ? roundPh(w) : null);
   const ph = lastThis
-    ? { weight: roundPh(convW(lastThis.weight, lastThis.unit)), reps: lastThis.reps, rir: lastThis.rir }
+    ? { weight: refSameUnit(lastThis.weight, lastThis.unit), reps: lastThis.reps, rir: lastThis.rir }
     : suggestion
-      ? { weight: roundPh(convW(suggestion.weight, suggestion.unit)), reps: suggestion.reps, rir: suggestion.rir }
-      : { weight: exercise.startWeight ?? null, reps: exercise.repMin, rir: exercise.rirMin };
+      ? { weight: refSameUnit(suggestion.weight, suggestion.unit), reps: suggestion.reps, rir: suggestion.rir }
+      : { weight: (displayUnit === 'kg' && exercise.startWeight != null) ? exercise.startWeight : null, reps: exercise.repMin, rir: exercise.rirMin };
 
   const completedSets = todaysets.length;
   const currentSetNumber = Math.min(completedSets + 1, exercise.sets);
@@ -1389,7 +1398,7 @@ function ExerciseCard({ index, exercise, settings, history, todaysets, photo, cu
 
   const handleLog = () => {
     if (!canLog) return;
-    onLogSet({ weight: parseFloat(weight), unit: settings.unit, reps: parseInt(reps), rir: parseInt(rir), weightMode: exercise.weightMode });
+    onLogSet({ weight: parseFloat(weight), unit: displayUnit, reps: parseInt(reps), rir: parseInt(rir), weightMode: exercise.weightMode });
     onStartRest();
     setWeight(''); setReps(''); setRir(null); // reset so the next set starts on grey placeholders again
   };
@@ -1410,7 +1419,7 @@ function ExerciseCard({ index, exercise, settings, history, todaysets, photo, cu
     setVideoInput('');
   };
 
-  const conversionDisplay = weight ? (settings.unit === 'kg' ? kgToLb(parseFloat(weight)) : lbToKg(parseFloat(weight))) : null;
+  const conversionDisplay = weight ? (displayUnit === 'kg' ? kgToLb(parseFloat(weight)) : lbToKg(parseFloat(weight))) : null;
 
   return (
     <div style={{ background: '#111', border: `1px solid ${isComplete ? '#22c55e' : '#1f1f1f'}`, borderRadius: 12, marginBottom: 10, overflow: 'hidden' }}>
@@ -1449,9 +1458,9 @@ function ExerciseCard({ index, exercise, settings, history, todaysets, photo, cu
               <span style={{ color: '#666' }}>LAST ({lastSession.date}):</span>{' '}
               <span className="mono" style={{ color: '#ccc' }}>{lastSession.sets.map(s => `${s.weight}${s.weightMode === 'perSide' ? '×2' : ''}${s.unit}×${s.reps}`).join(' · ')}</span>
             </div>
-            {suggestion && !isComplete && (
+            {suggestion && !isComplete && suggestion.unit === displayUnit && (
               <button onClick={fillSuggestion} title="Tap to fill these numbers" style={{ marginTop: 4, width: '100%', textAlign: 'left', background: '#1c1908', border: '1px solid #3d3410', borderRadius: 5, padding: '4px 7px', color: '#facc15', fontWeight: 700, fontSize: 10, lineHeight: 1.4 }}>
-                → Target: {roundPh(convW(suggestion.weight, suggestion.unit))} {settings.unit} × {suggestion.reps} @ RIR {suggestion.rir}
+                → Target: {roundPh(suggestion.weight)} {suggestion.unit} × {suggestion.reps} @ RIR {suggestion.rir}
                 <span style={{ display: 'block', color: '#a89a4a', fontWeight: 400, fontSize: 9 }}>{suggestion.reason} · tap to fill</span>
               </button>
             )}
@@ -1486,13 +1495,14 @@ function ExerciseCard({ index, exercise, settings, history, todaysets, photo, cu
 
       {!isComplete && (
         <>
-          <div style={{ padding: '9px 10px 0' }}>
-            <span style={{ display: 'inline-block', background: exercise.weightMode === 'perSide' ? '#3a1d0a' : '#0f1a14', color: exercise.weightMode === 'perSide' ? '#fdba74' : '#6ee7b7', border: `1px solid ${exercise.weightMode === 'perSide' ? '#7c3a12' : '#1f3a2c'}`, padding: '2px 8px', borderRadius: 5, fontSize: 9, fontWeight: 700, letterSpacing: '0.03em' }}>
+          <div style={{ padding: '9px 10px 0', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+            <span style={{ background: exercise.weightMode === 'perSide' ? '#3a1d0a' : '#0f1a14', color: exercise.weightMode === 'perSide' ? '#fdba74' : '#6ee7b7', border: `1px solid ${exercise.weightMode === 'perSide' ? '#7c3a12' : '#1f3a2c'}`, padding: '2px 8px', borderRadius: 5, fontSize: 9, fontWeight: 700, letterSpacing: '0.03em', minWidth: 0 }}>
               {exercise.weightMode === 'perSide' ? '⚖ LOG PER SIDE — one arm / one cable' : '⚖ LOG TOTAL — the machine/stack number'}
             </span>
+            <UnitToggle value={displayUnit} onChange={onUnit} />
           </div>
           <div style={{ padding: 10, display: 'flex', alignItems: 'center', gap: 5 }}>
-            <NumInput value={weight} onChange={setWeight} placeholder={ph.weight != null ? String(ph.weight) : settings.unit} step={2.5} hint={exercise.weightMode === 'perSide' ? '/side' : ''} />
+            <NumInput value={weight} onChange={setWeight} placeholder={ph.weight != null ? String(ph.weight) : displayUnit} step={2.5} hint={exercise.weightMode === 'perSide' ? '/side' : displayUnit} />
             <span style={{ color: '#444', fontSize: 13 }}>×</span>
             <NumInput value={reps} onChange={setReps} placeholder={ph.reps != null ? String(ph.reps) : 'reps'} step={1} small />
             <button onClick={handleLog} disabled={!canLog} style={{ background: canLog ? '#facc15' : '#1a1a1a', color: canLog ? '#0a0a0a' : '#444', padding: '9px 11px', borderRadius: 7, fontWeight: 700, fontSize: 11 }}>LOG</button>
@@ -1504,8 +1514,8 @@ function ExerciseCard({ index, exercise, settings, history, todaysets, photo, cu
           </div>
           {weight && (
             <div style={{ padding: '0 10px 7px', fontSize: 10, color: '#666', display: 'flex', justifyContent: 'space-between' }}>
-              <span className="mono">= {conversionDisplay} {settings.unit === 'kg' ? 'lb' : 'kg'}</span>
-              {exercise.weightMode === 'perSide' && <span>Total: {parseFloat(weight) * 2} {settings.unit}</span>}
+              <span className="mono">= {conversionDisplay} {displayUnit === 'kg' ? 'lb' : 'kg'}</span>
+              {exercise.weightMode === 'perSide' && <span>Total: {parseFloat(weight) * 2} {displayUnit}</span>}
             </div>
           )}
         </>
@@ -1618,6 +1628,16 @@ function parseTempo(t) {
 
 function Tag({ children }) {
   return <span style={{ fontSize: 9.5, color: '#aaa', background: '#1a1a1a', padding: '3px 6px', borderRadius: 4, fontWeight: 700 }}>{children}</span>;
+}
+
+function UnitToggle({ value, onChange }) {
+  return (
+    <div style={{ display: 'flex', background: '#0a0a0a', border: '1px solid #2a2a2a', borderRadius: 6, padding: 2, flexShrink: 0 }}>
+      {['kg', 'lb'].map(u => (
+        <button key={u} onClick={() => onChange(u)} style={{ background: value === u ? '#facc15' : 'transparent', color: value === u ? '#0a0a0a' : '#888', padding: '3px 9px', borderRadius: 4, fontSize: 10, fontWeight: 700 }}>{u}</button>
+      ))}
+    </div>
+  );
 }
 
 function NumInput({ value, onChange, placeholder, step = 1, hint, small }) {
@@ -2147,13 +2167,14 @@ function SettingsView({ settings, setSettings, onExportExcel, onExportJSON, onIm
       <div className="display" style={{ fontSize: 26, color: '#facc15', marginBottom: 12 }}>SETTINGS</div>
       <FeedbackSection feedback={feedback} onAdd={onAddFeedback} onRemove={onRemoveFeedback} />
       <SyncSettings status={syncStatus} lastSyncAt={lastSyncAt} onSave={onSaveSync} onSyncNow={onSyncNow} />
-      <SettingRow label="UNIT">
+      <SettingRow label="DEFAULT UNIT">
         <div style={{ display: 'flex', background: '#0a0a0a', borderRadius: 7, padding: 2, border: '1px solid #2a2a2a' }}>
           {['kg', 'lb'].map(u => (
             <button key={u} onClick={() => setSettings({ ...settings, unit: u })} style={{ padding: '7px 14px', background: settings.unit === u ? '#facc15' : 'transparent', color: settings.unit === u ? '#0a0a0a' : '#888', borderRadius: 5, fontWeight: 700, fontSize: 11 }}>{u.toUpperCase()}</button>
           ))}
         </div>
       </SettingRow>
+      <div style={{ fontSize: 9.5, color: '#666', margin: '-2px 2px 7px', lineHeight: 1.4 }}>Starting unit for new exercises. Each exercise also has its own kg/lb toggle on its card, and remembers what you last used.</div>
       <SettingRow label="BODYWEIGHT">
         <input type="number" inputMode="decimal" value={settings.bodyweight} onChange={e => setSettings({ ...settings, bodyweight: parseFloat(e.target.value) || 0 })} style={{ width: 70, background: '#0a0a0a', border: '1px solid #2a2a2a', color: '#f5f5f5', padding: 7, borderRadius: 5, fontSize: 12, fontFamily: 'JetBrains Mono, monospace', textAlign: 'center' }} />
         <span style={{ marginLeft: 7, color: '#888', fontSize: 11 }}>{settings.unit}</span>
@@ -2210,7 +2231,7 @@ function SettingsView({ settings, setSettings, onExportExcel, onExportJSON, onIm
         </div>
       </div>
 
-      <div style={{ marginTop: 14, fontSize: 9.5, color: '#444', textAlign: 'center' }}>v5.3 · Upper-Focus · Push / Pull / Lower / Upper</div>
+      <div style={{ marginTop: 14, fontSize: 9.5, color: '#444', textAlign: 'center' }}>v5.4 · Upper-Focus · Push / Pull / Lower / Upper</div>
     </div>
   );
 }

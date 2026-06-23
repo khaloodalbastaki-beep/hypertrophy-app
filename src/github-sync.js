@@ -95,6 +95,7 @@ export async function pullMerge(local) {
   const mergedBw = mergeBodyweight(local.bodyweightLog, rH.bodyweightLog);
   const mergedFeedback = mergeFeedback(local.feedback, rH.feedback);
   const mergedNotes = { ...(rH.notes || {}), ...(local.notes || {}) };
+  const mergedUnits = { ...(rH.units || {}), ...(local.units || {}) };
   return {
     shas: { history: h.sha, photos: p.sha },
     settings: rH.settings && (remoteNewer || !local.hasLocal) ? rH.settings : local.settings,
@@ -104,17 +105,19 @@ export async function pullMerge(local) {
     photos: { ...(rP.photos || {}), ...(local.photos || {}) },
     feedback: mergedFeedback,
     notes: mergedNotes,
+    units: mergedUnits,
     remoteExisted: !!h.sha,
     // local has sessions/bodyweight/feedback the remote doesn't yet -> caller should push
     localAhead: JSON.stringify(mergedHistory) !== JSON.stringify(rH.history || {})
       || JSON.stringify(mergedBw) !== JSON.stringify(rH.bodyweightLog || [])
       || JSON.stringify(mergedFeedback) !== JSON.stringify(rH.feedback || [])
-      || JSON.stringify(mergedNotes) !== JSON.stringify(rH.notes || {}),
+      || JSON.stringify(mergedNotes) !== JSON.stringify(rH.notes || {})
+      || JSON.stringify(mergedUnits) !== JSON.stringify(rH.units || {}),
   };
 }
 
 export async function pushHistory(state, sha) {
-  const doc = { version: 5, updatedAt: new Date().toISOString(), settings: state.settings, history: state.history, bodyweightLog: state.bodyweightLog, videos: state.videos, feedback: state.feedback || [], notes: state.notes || {} };
+  const doc = { version: 5, updatedAt: new Date().toISOString(), settings: state.settings, history: state.history, bodyweightLog: state.bodyweightLog, videos: state.videos, feedback: state.feedback || [], notes: state.notes || {}, units: state.units || {} };
   try { return await putFile('history.json', doc, sha, 'update history'); }
   catch (e) {
     if (!e.conflict) throw e;
@@ -125,6 +128,7 @@ export async function pushHistory(state, sha) {
       bodyweightLog: mergeBodyweight(state.bodyweightLog, cur.json?.bodyweightLog),
       feedback: mergeFeedback(state.feedback, cur.json?.feedback),
       notes: { ...(cur.json?.notes || {}), ...(state.notes || {}) },
+      units: { ...(cur.json?.units || {}), ...(state.units || {}) },
     };
     return await putFile('history.json', merged, cur.sha, 'update history (merged)');
   }
